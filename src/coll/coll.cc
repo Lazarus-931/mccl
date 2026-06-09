@@ -2,6 +2,7 @@
 
 #include "../include/comm.h"
 #include "../include/graph.h"
+#include "../include/param.h"
 #include "../device/all_reduce.h"
 #include "../device/all_gather.h"
 #include "../device/reduce_scatter.h"
@@ -10,12 +11,31 @@
 
 namespace mccl {
 
+namespace {
+DEFINE_MCCL_PARAM(DirectMaxBytes, "DIRECT_MAX_BYTES", 64 << 10);
+DEFINE_MCCL_PARAM(DirectMaxRanks, "DIRECT_MAX_RANKS", 8);
+
+bool useDirect(const mcclComm* comm, size_t bytes) {
+  if (comm->nRanks <= 1 || comm->nRanks > static_cast<int>(mcclParamDirectMaxRanks())) return false;
+  if (bytes > static_cast<size_t>(mcclParamDirectMaxBytes())) return false;
+  for (int p = 0; p < comm->nRanks; ++p)
+    if (p != comm->rank && !mcclTopoDirectLink(comm->system, comm->rank, p, nullptr, nullptr)) return false;
+  return true;
+}
+
+bool preferFlatTree(const mcclComm* comm) {
+  return comm->chan.flatTree && comm->enabled[MCCL_ALGO_TREE] != 0;
+}
+}
+
 // Validation lives HERE, before mcclLaunch: on a non-blocking comm the lambda runs on the worker, which
 // latches only fatal results — an mcclInvalidArgument raised inside it would be silently swallowed while
 // peer ranks block. count == 0 is a successful no-op (NCCL semantics), not an error.
 mcclResult mcclAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
+  if (useDirect(comm, count * mcclDataSize(dt)))
+    return mcclSetLastError(mcclLaunch(comm, [=]() { return directAllReduce(comm, sendbuff, recvbuff, count, dt, op); }));
   const int algo = mcclPickAlgo(comm, count * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringAllReduce(comm, sendbuff, recvbuff, count, dt, op)
@@ -47,7 +67,7 @@ mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, s
   if (comm == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (root < 0 || root >= comm->nRanks || (comm->rank == root && sendbuff == nullptr)) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
-  const int algo = mcclPickAlgo(comm, count * mcclDataSize(dt));
+  const int algo = preferFlatTree(comm) ? MCCL_ALGO_TREE : mcclPickAlgo(comm, count * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringBroadcast(comm, sendbuff, recvbuff, count, dt, root)
                                   : treeBroadcast(comm, sendbuff, recvbuff, count, dt, root);
@@ -58,7 +78,7 @@ mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size
   if (comm == nullptr || sendbuff == nullptr || root < 0 || root >= comm->nRanks || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (comm->rank == root && recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
-  const bool ring = mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
+  const bool ring = preferFlatTree(comm) ? false : mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
   return mcclSetLastError(mcclLaunch(comm, [=]() { return reduceImpl(comm, sendbuff, recvbuff, count, dt, op, root, ring); }));
 }
 

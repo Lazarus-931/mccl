@@ -141,7 +141,8 @@ mcclResult mcclCommInitRankConfig(mcclComm** out, int nRanks, mcclUniqueId commI
     mcclGetAlgoInfo(comm->graphs, nRanks, size_t{1} << 40, comm->enabled, &large);  // cost is linear in bytes, so 1 TiB bounds the pick for ANY size a caller can pass — 1 GiB left real >1 GiB calls picking a never-connected channel
     const mcclChannel& ch = comm->chan;
     const bool useRing = (small == MCCL_ALGO_RING || large == MCCL_ALGO_RING);
-    const bool useTree = (small == MCCL_ALGO_TREE || large == MCCL_ALGO_TREE);
+    const bool useTree = (small == MCCL_ALGO_TREE || large == MCCL_ALGO_TREE) ||
+                         (ch.flatTree && comm->enabled[MCCL_ALGO_TREE] != 0);
     std::set<int> peers;
     if (useRing) {
       if (ch.ring.next >= 0) peers.insert(ch.ring.next);

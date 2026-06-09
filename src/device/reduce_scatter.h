@@ -15,7 +15,6 @@
 
 namespace mccl {
 
-// Ring reduce-scatter: scatter-reduce on a work copy, then one rotation drops this rank's block into recvbuff.
 inline mcclResult ringReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || recvcount == 0) return mcclInvalidArgument;
@@ -24,20 +23,24 @@ inline mcclResult ringReduceScatter(mcclComm* comm, const void* sendbuff, void* 
   const size_t blk = recvcount * esz;
   if (n == 1) { std::memcpy(recvbuff, sendbuff, blk); return mcclSuccess; }
 
-  void* work = nullptr;
-  MCCLCHECK(mcclCommReserveScratch(comm, blk * static_cast<size_t>(n), &work));
-  std::memcpy(work, sendbuff, blk * static_cast<size_t>(n));
-  Primitives prims(comm, work, dt, ringOp, blk);
-  mcclResult rc = prims.ok() ? mcclSuccess : mcclSystemError;
+  void* scratch = nullptr;
+  MCCLCHECK(mcclCommReserveScratch(comm, blk * 3, &scratch));
+  char* recvS   = static_cast<char*>(scratch);
+  char* fold[2] = {recvS + blk, recvS + 2 * blk};
+  const char* sb = static_cast<const char*>(sendbuff);
+
+  Primitives prims(comm, recvbuff, dt, ringOp, 0);
+  mcclResult rc = mcclSuccess;
   for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
-    const int s = (r - i + n) % n, d = (r - i - 1 + n) % n;
-    rc = prims.recvReduceSend(static_cast<size_t>(s) * recvcount, recvcount, static_cast<size_t>(d) * recvcount, recvcount);
+    const int sIdx = (r - i - 1 + 2 * n) % n;
+    const int dIdx = (r - i - 2 + 2 * n) % n;
+    const void* sp = (i == 0) ? sb + static_cast<size_t>(sIdx) * blk : fold[(i - 1) & 1];
+    rc = prims.sendRecv(sp, blk, recvS, blk);
+    if (rc != mcclSuccess) break;
+    void* dst = (i == n - 2) ? recvbuff : static_cast<void*>(fold[i & 1]);
+    rc = reduceOut(dst, sb + static_cast<size_t>(dIdx) * blk, recvS, recvcount, dt, ringOp);
   }
-  if (rc == mcclSuccess) {
-    const int own = (r + 1) % n;
-    rc = prims.sendRecv(static_cast<char*>(work) + static_cast<size_t>(own) * blk, blk, recvbuff, blk);
-  }
-  if (rc == mcclSuccess && op == mcclAvg) rc = cpuScale(recvbuff, recvcount, dt, 1.0 / n);
+  if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, recvcount, dt, 1.0 / n);
   return rc;
 }
 
@@ -70,7 +73,7 @@ inline mcclResult treeReduceScatter(mcclComm* comm, const void* sendbuff, void* 
     if (comm->parent != nullptr) MCCLCHECK(mcclM2MRecv(comm->parent, px, Sx.size() * blk));
     const size_t myPos = static_cast<size_t>(std::lower_bound(Sx.begin(), Sx.end(), r) - Sx.begin());
     std::memcpy(recvbuff, px + myPos * blk, blk);
-    if (op == mcclAvg) MCCLCHECK(cpuScale(recvbuff, recvcount, dt, 1.0 / n));
+    if (op == mcclAvg) MCCLCHECK(scaleBuf(recvbuff, recvcount, dt, 1.0 / n));
 
     void* pc = nullptr;
     if (!comm->childConns.empty()) MCCLCHECK(mcclCommReserveStaging(comm, blk * static_cast<size_t>(n), &pc));
@@ -103,7 +106,7 @@ inline mcclResult treeReduceScatter(mcclComm* comm, const void* sendbuff, void* 
     return mcclM2MRecv(comm->childConns[k], static_cast<char*>(stg) + k * blk * static_cast<size_t>(n), blk * static_cast<size_t>(n));
   });
   if (res == mcclSuccess) res = reduceMulti(work, stg, whole, nc, whole, dt, redOp, gpu);
-  if (res == mcclSuccess && op == mcclAvg) res = cpuScale(work, whole, dt, 1.0 / n);
+  if (res == mcclSuccess && op == mcclAvg) res = scaleBuf(work, whole, dt, 1.0 / n);
   if (res == mcclSuccess) std::memcpy(recvbuff, static_cast<char*>(work) + static_cast<size_t>(r) * blk, blk);
   if (res == mcclSuccess)
     res = forEachChild(nc, [&](size_t k) {
