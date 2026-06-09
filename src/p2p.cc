@@ -69,28 +69,33 @@ mcclResult runBatch(mcclComm* comm, std::vector<P2pOp> ops) {
 
 }
 
-// Deadlock-free: the lower rank dials, the higher accepts. Accepted conns are collected locally and merged
-// into `target` only after the accept thread joins, so this owner thread is the sole writer of the map.
+// Deadlock-free: the lower rank dials, the higher accepts. The accept thread loops until every EXPECTED peer
+// has arrived — never a fixed count, because an early dial from some other lower-ranked peer (for a later op)
+// can land first; such a connection is legitimate, so it is kept and merged too, it just doesn't satisfy this
+// call. Accepted conns are collected locally and merged after the join; map inserts take comm->connMu so a
+// concurrent mcclCommAbort can iterate the maps safely.
 mcclResult mcclEnsurePeerConnsInto(mcclComm* comm, const std::set<int>& peers, std::map<int, mcclM2M*>& target) {
   std::vector<int> toDial;
-  int toAccept = 0;
+  std::set<int> awaiting;
   for (int p : peers) {
     if (p == comm->rank || target.count(p)) continue;
     if (p > comm->rank) toDial.push_back(p);
-    else                ++toAccept;
+    else                awaiting.insert(p);
   }
-  if (toDial.empty() && toAccept == 0) return mcclSuccess;
+  if (toDial.empty() && awaiting.empty()) return mcclSuccess;
 
   std::vector<std::pair<int, mcclM2M*>> accepted;
   mcclResult arc = mcclSuccess;
   std::thread acc;
-  if (toAccept > 0) acc = std::thread([&]() {
-    for (int i = 0; i < toAccept; ++i) {
+  if (!awaiting.empty()) acc = std::thread([&]() {
+    std::set<int> want = awaiting;
+    while (!want.empty()) {
       mcclM2M* conn = nullptr;
       if ((arc = mcclM2MAccept(comm->listener, &conn)) != mcclSuccess) return;
       int pr = -1;
       if ((arc = mcclM2MRecv(conn, &pr, sizeof(pr))) != mcclSuccess) { mcclM2MClose(conn); return; }
       accepted.push_back({pr, conn});
+      want.erase(pr);
     }
   });
   mcclResult crc = mcclSuccess;
@@ -100,10 +105,18 @@ mcclResult mcclEnsurePeerConnsInto(mcclComm* comm, const std::set<int>& peers, s
     mcclM2M* conn = nullptr;
     if ((crc = mcclM2MConnect(ip, comm->peerPorts[static_cast<size_t>(p)], static_cast<m2mType>(comm->m2mType), &conn)) != mcclSuccess) break;
     if ((crc = mcclM2MSend(conn, &comm->rank, sizeof(comm->rank))) != mcclSuccess) { mcclM2MClose(conn); break; }
+    std::lock_guard<std::mutex> lk(comm->connMu);
     target[p] = conn;
   }
   if (acc.joinable()) acc.join();
-  for (auto& kv : accepted) target[kv.first] = kv.second;
+  {
+    std::lock_guard<std::mutex> lk(comm->connMu);
+    for (auto& kv : accepted) {
+      mcclM2M*& slot = target[kv.first];
+      if (slot == nullptr) slot = kv.second;
+      else mcclM2MClose(kv.second);  // duplicate dial for an already-known peer: keep the existing conn
+    }
+  }
   return crc != mcclSuccess ? crc : arc;
 }
 
@@ -135,14 +148,26 @@ mcclResult mcclGroupEnd() {
   std::map<mcclComm*, std::vector<P2pOp>> byComm;
   for (const P2pOp& o : g_group.ops) byComm[o.comm].push_back(o);
   g_group.ops.clear();
-  mcclResult first = mcclSuccess;
-  for (auto& kv : byComm) {
-    mcclComm* comm = kv.first;
-    std::vector<P2pOp> ops = std::move(kv.second);
-    const mcclResult r = mcclLaunch(comm, [comm, ops]() { return runBatch(comm, ops); });
-    if (r != mcclSuccess && first == mcclSuccess) first = r;
-  }
-  return first == mcclSuccess ? mcclSuccess : mcclSetLastError(first);
+  // All comms' batches launch CONCURRENTLY: byComm's pointer order differs across processes, so launching
+  // blocking batches sequentially deadlocks the moment rank A runs comm1-then-comm2 while rank B runs
+  // comm2-then-comm1 with transfers too big for the socket buffers. One thread per comm — group calls are
+  // rare and the comm count is small; the per-comm batch itself fans out through the pools.
+  std::vector<std::pair<mcclComm*, std::vector<P2pOp>>> batches;
+  batches.reserve(byComm.size());
+  for (auto& kv : byComm) batches.push_back({kv.first, std::move(kv.second)});
+  std::vector<mcclResult> rcs(batches.size(), mcclSuccess);
+  // The launched lambda owns its ops (value capture): on a non-blocking comm it outlives this frame on the worker.
+  auto launchOne = [](std::pair<mcclComm*, std::vector<P2pOp>>& b) {
+    mcclComm* c = b.first;
+    return mcclLaunch(c, [c, ops = std::move(b.second)]() { return runBatch(c, ops); });
+  };
+  std::vector<std::thread> ts;
+  for (size_t i = 1; i < batches.size(); ++i)
+    ts.emplace_back([&, i]() { rcs[i] = launchOne(batches[i]); });
+  if (!batches.empty()) rcs[0] = launchOne(batches[0]);
+  for (std::thread& t : ts) t.join();
+  for (mcclResult r : rcs) if (r != mcclSuccess) return mcclSetLastError(r);
+  return mcclSuccess;
 }
 
 }

@@ -1,8 +1,10 @@
 #include "pool.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -56,23 +58,47 @@ int poolThreads() {
 ThreadPool& mcclStripePool() { static ThreadPool p(poolThreads()); return p; }
 ThreadPool& mcclFanoutPool() { static ThreadPool p(poolThreads()); return p; }
 
+// Tasks are CLAIMED (atomic counter) by the caller and by pool helpers alike, never assigned: the caller keeps
+// claiming until the batch is exhausted, so a saturated pool cannot strand a task behind blocked workers. That
+// is the deadlock-freedom argument for blocking I/O tasks — every rank's caller can always reach every task of
+// its own op (worst case it runs them all serially), so the peer's matching send/recv always eventually runs.
+// Pool helpers that wake after the batch is spent exit via the claim check; shared_ptr keeps state alive for them.
 mcclResult mcclParallel(ThreadPool& pool, size_t count, const std::function<mcclResult(size_t)>& fn) {
   if (count == 0) return mcclSuccess;
   if (count == 1) return fn(0);
-  std::vector<mcclResult> rc(count, mcclSuccess);
-  std::mutex m;
-  std::condition_variable done;
-  size_t finished = 0;
-  for (size_t k = 1; k < count; ++k)
-    pool.submit([&, k]() {
-      try { rc[k] = fn(k); } catch (...) { rc[k] = mcclInternalError; }
-      std::lock_guard<std::mutex> lk(m);  // notify under the lock: the waiter must not wake + destroy m/done before this returns
-      ++finished;
-      done.notify_one();
-    });
-  try { rc[0] = fn(0); } catch (...) { rc[0] = mcclInternalError; }
-  { std::unique_lock<std::mutex> lk(m); done.wait(lk, [&]() { return finished == count - 1; }); }
-  for (mcclResult r : rc) if (r != mcclSuccess) return r;
+
+  struct Batch {
+    std::function<mcclResult(size_t)> fn;
+    std::vector<mcclResult>           rc;
+    std::atomic<size_t>               next{0};
+    std::mutex                        mu;
+    std::condition_variable           cv;
+    size_t                            done = 0;
+  };
+  auto b = std::make_shared<Batch>();
+  b->fn = fn;
+  b->rc.assign(count, mcclSuccess);
+
+  auto claimLoop = [count](const std::shared_ptr<Batch>& s) {
+    for (;;) {
+      const size_t k = s->next.fetch_add(1, std::memory_order_relaxed);
+      if (k >= count) return;
+      mcclResult r;
+      try { r = s->fn(k); } catch (...) { r = mcclInternalError; }
+      std::lock_guard<std::mutex> lk(s->mu);
+      s->rc[k] = r;
+      ++s->done;
+      s->cv.notify_one();
+    }
+  };
+
+  for (size_t k = 1; k < count; ++k) pool.submit([b, claimLoop]() { claimLoop(b); });
+  claimLoop(b);
+  {
+    std::unique_lock<std::mutex> lk(b->mu);
+    b->cv.wait(lk, [&]() { return b->done == count; });
+  }
+  for (mcclResult r : b->rc) if (r != mcclSuccess) return r;
   return mcclSuccess;
 }
 

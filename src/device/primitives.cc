@@ -1,7 +1,6 @@
 #include "primitives.h"
 
 #include "fanout.h"
-#include "metal.h"
 #include "reduce_kernel.h"
 #include "../pool.h"
 #include "../include/comm.h"
@@ -19,7 +18,7 @@ Primitives::Primitives(mcclComm* comm, void* buf, mcclDataType dt, mcclRedOp op,
       dt_(dt),
       op_(op),
       esz_(mcclDataSize(dt)),
-      gpu_(mcclMetalAvailable() && pageAligned(buf)),
+      gpu_(pageAligned(buf)),  // Metal availability is probed inside reduce()/reduceMulti(), past the size gate — constructing the Metal context here would put a multi-second XPC stall on every small-message path
       valid_(true),
       staging_(nullptr),
       stagingStride_(maxChunkBytes),

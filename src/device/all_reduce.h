@@ -7,6 +7,7 @@
 #include "primitives.h"
 #include "reduce_kernel.h"
 #include "../include/comm.h"
+#include "../transport/m2m.h"
 
 namespace mccl {
 
@@ -45,8 +46,15 @@ inline mcclResult treeAllReduce(mcclComm* comm, const void* sendbuff, void* recv
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || count == 0) return mcclInvalidArgument;
   const mcclRedOp ringOp = (op == mcclAvg) ? mcclSum : op;
-  if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, count * esz);
-  if (comm->nRanks == 1) return mcclSuccess;
+  if (comm->nRanks == 1) {
+    if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, count * esz);
+    return mcclSuccess;
+  }
+  // A pure leaf sends straight from sendbuff and recvFromParent later overwrites recvbuff, so the upfront
+  // copy is dead work there (a full extra buffer sweep on every non-hub rank of the default flat tree).
+  // dtree ranks are interior in one of the two trees, so they keep the copy.
+  const bool leaf = !comm->chan.dtree && comm->childConns.empty();
+  if (sendbuff != recvbuff && !leaf) std::memcpy(recvbuff, sendbuff, count * esz);
 
   if (comm->chan.dtree) {
     // Double tree: reduce the first half over tree A and the second over tree B concurrently. The trees use
@@ -91,6 +99,7 @@ inline mcclResult treeAllReduce(mcclComm* comm, const void* sendbuff, void* recv
   auto chunk = [&](int i, size_t* off, size_t* cnt) { *off = chunkOffElems(count, K, i); *cnt = chunkOffElems(count, K, i + 1) - *off; };
   auto up = [&](int i) -> mcclResult {
     size_t off, cnt; chunk(i, &off, &cnt);
+    if (leaf) return mcclM2MSend(comm->parent, static_cast<const char*>(sendbuff) + off * esz, cnt * esz);
     const mcclResult r = prims.reduceFromChildren(off, cnt);
     return r == mcclSuccess ? prims.sendToParent(off, cnt) : r;
   };

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <utility>
 #include <vector>
@@ -56,6 +57,7 @@ struct mcclComm {
   mcclWorkQueue* work = nullptr;
   mcclM2MListener*        listener = nullptr;  // stays open past init for on-demand Send/Recv connections
   std::vector<uint16_t>   peerPorts;
+  std::mutex              connMu;              // guards map INSERTS (owner thread) vs Abort's iteration (any thread); owner-thread reads need no lock
   std::map<int, mcclM2M*> peerConns;           // owns all connections; next/prev/parent/childConns alias into it
   std::map<int, mcclM2M*> peerConnsB;          // second tree's own connections (dtree), kept separate so the trees never share a socket
 };

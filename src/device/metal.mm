@@ -124,6 +124,10 @@ mcclResult mcclMetalReduceMulti(void* dst, const void* src, size_t count, size_t
   const size_t doff = da - dbase, soff = sa - sbase;
   const size_t need = esz < 4 ? 4 : esz;
   if (doff % need != 0 || soff % need != 0 || (strideElems * esz) % need != 0) return mcclInvalidUsage;
+  // The kernel takes count/nSrc/stride as 32-bit uints and indexes src with uint math; anything that would
+  // wrap must take the (correct, slower) CPU path instead of silently folding only count mod 2^32 elements.
+  if (count > UINT32_MAX || nSrc > UINT32_MAX || strideElems > UINT32_MAX ||
+      (nSrc - 1) * strideElems + count > UINT32_MAX) return mcclInvalidUsage;
   const size_t srcSpan = soff + (nSrc - 1) * strideElems * esz + count * esz;
   __block mcclResult res = mcclSystemError;
   @autoreleasepool {  // collectives call this in a tight loop; drain the per-dispatch Metal objects each time

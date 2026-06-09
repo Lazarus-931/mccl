@@ -138,7 +138,7 @@ mcclResult mcclCommInitRankConfig(mcclComm** out, int nRanks, mcclUniqueId commI
     // so the two size extremes bound every per-call choice: a channel that loses at both never runs.
     int small = comm->channel, large = comm->channel;
     mcclGetAlgoInfo(comm->graphs, nRanks, 1, comm->enabled, &small);
-    mcclGetAlgoInfo(comm->graphs, nRanks, 1u << 30, comm->enabled, &large);
+    mcclGetAlgoInfo(comm->graphs, nRanks, size_t{1} << 40, comm->enabled, &large);  // cost is linear in bytes, so 1 TiB bounds the pick for ANY size a caller can pass — 1 GiB left real >1 GiB calls picking a never-connected channel
     const mcclChannel& ch = comm->chan;
     const bool useRing = (small == MCCL_ALGO_RING || large == MCCL_ALGO_RING);
     const bool useTree = (small == MCCL_ALGO_TREE || large == MCCL_ALGO_TREE);
@@ -269,26 +269,20 @@ mcclResult mcclCommFinalize(mcclComm* comm) {
   return rc == mcclSuccess ? mcclSuccess : mcclSetLastError(rc);
 }
 
-// Fault recovery: shut the connections down (via the stable alias pointers, not the map the worker may be
-// mutating) to unblock a stuck worker, then join it, then free the maps.
+// Fault recovery: SHUTDOWN (never close/free) every connection — including p2p / hub-to-root conns that live
+// only in the maps, which a stuck worker may be parked on — plus the listener, so accept-waiters unblock too.
+// Freeing stays in mcclCommDestroy: on a blocking comm a user thread can still be inside a collective holding
+// these pointers, so Abort closing fds would be a use-after-free / fd-recycle data corruption.
 mcclResult mcclCommAbort(mcclComm* comm) {
   if (comm == nullptr) return mcclSetLastError(mcclInvalidArgument);
   comm->aborted = true;
-  if (comm->next)    mcclM2MShutdown(comm->next);
-  if (comm->prev)    mcclM2MShutdown(comm->prev);
-  if (comm->parent)  mcclM2MShutdown(comm->parent);
-  if (comm->parentB) mcclM2MShutdown(comm->parentB);
-  for (mcclM2M* c : comm->childConns)  if (c) mcclM2MShutdown(c);
-  for (mcclM2M* c : comm->childConnsB) if (c) mcclM2MShutdown(c);
+  {
+    std::lock_guard<std::mutex> lk(comm->connMu);
+    for (auto& kv : comm->peerConns)  if (kv.second) mcclM2MShutdown(kv.second);
+    for (auto& kv : comm->peerConnsB) if (kv.second) mcclM2MShutdown(kv.second);
+    if (comm->listener) mcclM2MListenShutdown(comm->listener);
+  }
   mcclWorkerStop(comm);
-  for (auto& kv : comm->peerConns)  if (kv.second) mcclM2MClose(kv.second);
-  for (auto& kv : comm->peerConnsB) if (kv.second) mcclM2MClose(kv.second);
-  comm->peerConns.clear();
-  comm->peerConnsB.clear();
-  comm->next = comm->prev = comm->parent = comm->parentB = nullptr;
-  comm->childConns.clear();
-  comm->childConnsB.clear();
-  if (comm->listener) { mcclM2MListenClose(comm->listener); comm->listener = nullptr; }
   return mcclSuccess;
 }
 
@@ -320,12 +314,24 @@ mcclResult mcclCommSplit(mcclComm* comm, int color, int key, mcclComm** newcomm,
   for (int i = 0; i < newN; ++i) if (grp[static_cast<size_t>(i)].second == r) newRank = i;
   if (newRank < 0) return mcclSetLastError(mcclInternalError);
 
+  // Port by the color's index among this call's sorted distinct colors — every rank computes the same array, and
+  // distinct groups get distinct ports with no modulo aliasing (color & 0x3F collided for colors equal mod 64).
+  std::vector<int> distinctColors;
+  for (int i = 0; i < n; ++i)
+    if (all[static_cast<size_t>(i)].color != MCCL_SPLIT_NOCOLOR) distinctColors.push_back(all[static_cast<size_t>(i)].color);
+  std::sort(distinctColors.begin(), distinctColors.end());
+  distinctColors.erase(std::unique(distinctColors.begin(), distinctColors.end()), distinctColors.end());
+  const size_t groupIdx = static_cast<size_t>(std::lower_bound(distinctColors.begin(), distinctColors.end(), color) - distinctColors.begin());
+  const uint16_t subPort = static_cast<uint16_t>(comm->rootPort + 1000 + groupIdx * 8);
+
+  // On a pure point-to-point TB mesh no subnet spans every rank, so lanIp is 0 — fall back to the parent's
+  // bootstrap host, which every member could already reach (it bootstrapped through it).
   char subIp[16];
-  mcclIpStr(all[static_cast<size_t>(grp[0].second)].lanIp, subIp);
-  const uint16_t subPort = static_cast<uint16_t>(comm->rootPort + 1000 + (color & 0x3F) * 8);
+  const uint32_t leadIp = all[static_cast<size_t>(grp[0].second)].lanIp;
+  const char* subIpStr = leadIp != 0 ? mcclIpStr(leadIp, subIp) : comm->rootIp;
   mcclUniqueId subId{};
   IdData d{};
-  std::snprintf(d.ip, sizeof(d.ip), "%s", subIp);
+  std::snprintf(d.ip, sizeof(d.ip), "%s", subIpStr);
   d.port = subPort;
   std::memcpy(subId.internal, &d, sizeof(d));
   return mcclCommInitRankConfig(newcomm, newN, subId, newRank, config != nullptr ? config : &comm->config);

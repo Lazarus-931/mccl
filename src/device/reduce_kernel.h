@@ -71,12 +71,15 @@ inline bool pageAligned(const void* p) {
 }
 
 // dst = op(dst, src). Metal only above MCCL_METAL_MIN_BYTES — below that, dispatch latency outweighs the
-// arithmetic so the CPU wins (and UMA means the CPU reads the same buffer with no copy). CPU is also the
-// fallback when there's no GPU kernel for the dtype/op.
+// arithmetic so the CPU wins (and UMA means the CPU reads the same buffer with no copy). mcclMetalAvailable()
+// is checked only past the size gate: it constructs the Metal context (device + runtime kernel compile, an XPC
+// round trip that can stall tens of seconds when many ranks launch at once), so small-message paths must never
+// touch it. Any Metal failure falls back to the CPU — the result is what matters, not the engine; a transient
+// GPU error must not poison the comm.
 inline mcclResult reduce(void* dst, const void* src, size_t count, mcclDataType dt, mcclRedOp op, bool gpu) {
-  if (gpu && count * mcclDataSize(dt) >= static_cast<size_t>(mcclParamMetalMinBytes())) {
+  if (gpu && count * mcclDataSize(dt) >= static_cast<size_t>(mcclParamMetalMinBytes()) && mcclMetalAvailable()) {
     const mcclResult rc = mcclMetalReduce(dst, src, count, dt, op);
-    if (rc != mcclInvalidUsage) return rc;
+    if (rc == mcclSuccess) return rc;
   }
   return cpuReduce(dst, src, count, dt, op);
 }
@@ -86,9 +89,9 @@ inline mcclResult reduce(void* dst, const void* src, size_t count, mcclDataType 
 inline mcclResult reduceMulti(void* dst, const void* srcBase, size_t count, size_t nSrc, size_t strideElems,
                               mcclDataType dt, mcclRedOp op, bool gpu) {
   if (nSrc == 0 || count == 0) return mcclSuccess;
-  if (gpu && count * mcclDataSize(dt) >= static_cast<size_t>(mcclParamMetalMinBytes())) {
+  if (gpu && count * mcclDataSize(dt) >= static_cast<size_t>(mcclParamMetalMinBytes()) && mcclMetalAvailable()) {
     const mcclResult rc = mcclMetalReduceMulti(dst, srcBase, count, nSrc, strideElems, dt, op);
-    if (rc != mcclInvalidUsage) return rc;
+    if (rc == mcclSuccess) return rc;
   }
   const char* base = static_cast<const char*>(srcBase);
   const size_t esz = mcclDataSize(dt);
