@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+# mccl ships reduce.metal (compiled at runtime); expose its install location so consumers can set
+# MCCL_METAL_DIR if the file is not beside their binary.
+set(MCCL_METAL_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/mccl")
+
+include("${CMAKE_CURRENT_LIST_DIR}/mcclTargets.cmake")
+
+check_required_components(MCCL)
