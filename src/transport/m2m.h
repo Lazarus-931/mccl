@@ -25,6 +25,7 @@ mcclResult mcclM2MClose(mcclM2M* c);
 struct mcclM2MListener;
 mcclResult mcclM2MListenStart(uint16_t port, mcclM2MListener** out, uint16_t* boundPort);
 mcclResult mcclM2MAccept(mcclM2MListener* l, mcclM2M** out);
+mcclResult mcclM2MListenShutdown(mcclM2MListener* l);  // unblock accept-waiters without freeing (Abort); Close still frees
 mcclResult mcclM2MListenClose(mcclM2MListener* l);
 
 }

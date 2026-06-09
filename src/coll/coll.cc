@@ -10,8 +10,12 @@
 
 namespace mccl {
 
+// Validation lives HERE, before mcclLaunch: on a non-blocking comm the lambda runs on the worker, which
+// latches only fatal results — an mcclInvalidArgument raised inside it would be silently swallowed while
+// peer ranks block. count == 0 is a successful no-op (NCCL semantics), not an error.
 mcclResult mcclAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
-  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
+  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (count == 0) return mcclSuccess;
   const int algo = mcclPickAlgo(comm, count * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringAllReduce(comm, sendbuff, recvbuff, count, dt, op)
@@ -20,7 +24,8 @@ mcclResult mcclAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, s
 }
 
 mcclResult mcclAllGather(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount, mcclDataType dt) {
-  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
+  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (sendcount == 0) return mcclSuccess;
   const int algo = mcclPickAlgo(comm, sendcount * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringAllGather(comm, sendbuff, recvbuff, sendcount, dt)
@@ -29,7 +34,8 @@ mcclResult mcclAllGather(mcclComm* comm, const void* sendbuff, void* recvbuff, s
 }
 
 mcclResult mcclReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
-  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
+  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (recvcount == 0) return mcclSuccess;
   const int algo = mcclPickAlgo(comm, recvcount * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringReduceScatter(comm, sendbuff, recvbuff, recvcount, dt, op)
@@ -38,7 +44,9 @@ mcclResult mcclReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuf
 }
 
 mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, int root) {
-  if (comm == nullptr || recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
+  if (comm == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (root < 0 || root >= comm->nRanks || (comm->rank == root && sendbuff == nullptr)) return mcclSetLastError(mcclInvalidArgument);
+  if (count == 0) return mcclSuccess;
   const int algo = mcclPickAlgo(comm, count * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringBroadcast(comm, sendbuff, recvbuff, count, dt, root)
@@ -47,7 +55,9 @@ mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, s
 }
 
 mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op, int root) {
-  if (comm == nullptr || sendbuff == nullptr || root < 0 || root >= comm->nRanks) return mcclSetLastError(mcclInvalidArgument);
+  if (comm == nullptr || sendbuff == nullptr || root < 0 || root >= comm->nRanks || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (comm->rank == root && recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
+  if (count == 0) return mcclSuccess;
   const bool ring = mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
   return mcclSetLastError(mcclLaunch(comm, [=]() { return reduceImpl(comm, sendbuff, recvbuff, count, dt, op, root, ring); }));
 }

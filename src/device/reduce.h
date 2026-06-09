@@ -25,14 +25,20 @@ inline mcclResult treeReduce(mcclComm* comm, const void* sendbuff, void* recvbuf
   if (me == root && recvbuff == nullptr) return mcclInvalidArgument;
 
   const bool keepHere = (me == hub && me == root);
+  const bool leaf = comm->childConns.empty();  // n>1 means the hub always has children, so a leaf is never the hub
   void* work = recvbuff;
-  if (!keepHere) MCCLCHECK(mcclCommReserveScratch(comm, count * esz, &work));
-  if (work != sendbuff) std::memcpy(work, sendbuff, count * esz);  // in-place reduce: src == dst, skip the copy
+  mcclResult rc = mcclSuccess;
+  if (leaf) {
+    rc = mcclM2MSend(comm->parent, sendbuff, count * esz);  // up-phase is just "ship my input": no scratch, no copy
+  } else {
+    if (!keepHere) MCCLCHECK(mcclCommReserveScratch(comm, count * esz, &work));
+    if (work != sendbuff) std::memcpy(work, sendbuff, count * esz);  // in-place reduce: src == dst, skip the copy
 
-  Primitives prims(comm, work, dt, redOp, count * esz);
-  mcclResult rc = prims.ok() ? mcclSuccess : mcclSystemError;
-  if (rc == mcclSuccess) rc = prims.reduceFromChildren(0, count);
-  if (rc == mcclSuccess && me != hub) rc = prims.sendToParent(0, count);
+    Primitives prims(comm, work, dt, redOp, count * esz);
+    rc = prims.ok() ? mcclSuccess : mcclSystemError;
+    if (rc == mcclSuccess) rc = prims.reduceFromChildren(0, count);
+    if (rc == mcclSuccess && me != hub) rc = prims.sendToParent(0, count);
+  }
 
   if (rc == mcclSuccess && hub != root) {  // deliver the hub's sum to the user's root, one hop (find, not at: no throw on the worker thread)
     if (me == hub)  { rc = mcclEnsurePeerConns(comm, {root}); const auto it = comm->peerConns.find(root); if (rc == mcclSuccess) rc = (it != comm->peerConns.end()) ? mcclM2MSend(it->second, work, count * esz) : mcclInternalError; }

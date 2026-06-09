@@ -3,6 +3,9 @@
 #include "socket.h"
 #include "include/checks.h"
 
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include <cstring>
 #include <vector>
 
@@ -12,6 +15,15 @@ namespace {
 constexpr int kAcceptTimeoutMs  = 30000;
 constexpr int kConnectTimeoutMs = 5000;
 constexpr int kConnectRetries   = 100;  // ~10s of 100ms backoff to absorb the root coming up after the workers
+
+// Rendezvous transfers are small and the peer set is fixed, so every blocking call gets a deadline: a rank
+// that dies silently mid-round (power loss, SIGSTOP) must fail the round, not wedge every other rank forever.
+void deadline(int fd) {
+  timeval tv{};
+  tv.tv_sec = kAcceptTimeoutMs / 1000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 }
 
 mcclResult mcclBootstrapAllGather(const char* rootIp, uint16_t rootPort, int rank, int nRanks,
@@ -35,6 +47,7 @@ mcclResult mcclBootstrapAllGather(const char* rootIp, uint16_t rootPort, int ran
     for (int i = 0; i < nRanks - 1; ++i) {
       int fd = -1, peerRank = -1;
       if ((rc = mcclSocketAccept(lst, kAcceptTimeoutMs, &fd)) != mcclSuccess) goto done;
+      deadline(fd);
       if ((rc = mcclSocketRecv(fd, &peerRank, sizeof(peerRank))) != mcclSuccess) { mcclSocketClose(fd); goto done; }
       if (peerRank <= 0 || peerRank >= nRanks || conns[peerRank] != -1) {
         mcclSocketClose(fd);
@@ -45,6 +58,11 @@ mcclResult mcclBootstrapAllGather(const char* rootIp, uint16_t rootPort, int ran
       if ((rc = mcclSocketRecv(fd, recv + static_cast<size_t>(peerRank) * perRankBytes, perRankBytes)) != mcclSuccess)
         goto done;
     }
+    // Close the listener BEFORE fanning results out: a rank that gets its result early and immediately dials
+    // this port for the NEXT round must get a refusal (its connect retries absorb that) — with the listener
+    // still open, its SYN lands in this round's backlog and is RST on close, failing the next round outright.
+    mcclSocketClose(lst);
+    lst = -1;
     for (int r = 1; r < nRanks && rc == mcclSuccess; ++r)
       rc = mcclSocketSend(conns[r], recv, total);
   done:
@@ -55,6 +73,7 @@ mcclResult mcclBootstrapAllGather(const char* rootIp, uint16_t rootPort, int ran
 
   int fd = -1;
   MCCLCHECK(mcclSocketConnect(rootIp, rootPort, kConnectTimeoutMs, kConnectRetries, &fd));
+  deadline(fd);
   mcclResult rc = mcclSocketSend(fd, &rank, sizeof(rank));
   if (rc == mcclSuccess) rc = mcclSocketSend(fd, send, perRankBytes);
   if (rc == mcclSuccess) rc = mcclSocketRecv(fd, recv, total);

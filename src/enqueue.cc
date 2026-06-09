@@ -33,7 +33,7 @@ void workerLoop(mcclWorkQueue* w) {
     {
       std::unique_lock<std::mutex> lk(w->mu);
       w->cv.wait(lk, [w]() { return w->stop || !w->q.empty(); });
-      if (w->stop) return;
+      if (w->stop && w->q.empty()) return;  // drain on stop: an accepted (mcclSuccess) enqueue must run, or peers desync with no error anywhere
       job = std::move(w->q.front());
       w->q.pop_front();
       latched = w->firstError;

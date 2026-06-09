@@ -1,10 +1,7 @@
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -21,6 +18,7 @@
 
 #include "init.h"
 #include "bootstrap.h"
+#include "socket.h"
 #include "graph/discover.h"
 #include "graph/topo.h"
 #include "include/checks.h"
@@ -30,79 +28,26 @@ namespace mccl {
 namespace {
 
 constexpr size_t kBufBytes = 4u << 20;
-constexpr int    kSockBuf  = 4 << 20;
 
 double secondsSince(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void tuneSocket(int fd) {
-  int one = 1;
-  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  int sz = kSockBuf;
-  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
-  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
 
-bool connectTimeout(int fd, const sockaddr_in& addr, int timeoutMs) {
-  const int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0) return false;
-  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  bool ok = false;
-  if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
-    ok = true;
-  } else if (errno == EINPROGRESS) {
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    if (select(fd + 1, nullptr, &wfds, nullptr, &tv) > 0) {
-      int err = 0;
-      socklen_t len = sizeof(err);
-      ok = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
-    }
-  }
-  fcntl(fd, F_SETFL, flags);
-  return ok;
-}
-
-}
-
+// Both sides ride the socket.cc helpers so the measured link runs with the SAME socket options as the data
+// path it calibrates (NODELAY/NOSIGPIPE/MCCL_SOCKET_BUF_KB) — a private socket setup here would measure a
+// different configuration than the one the cost model feeds.
 mcclBandwidthResult mcclBandwidthServe(uint16_t port, int acceptTimeoutMs) {
   mcclBandwidthResult r;
-  int lst = socket(AF_INET, SOCK_STREAM, 0);
-  if (lst < 0) return r;
-  int one = 1;
-  setsockopt(lst, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-  if (bind(lst, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(lst, 1) != 0) {
-    close(lst);
-    return r;
-  }
-
-  fd_set rfds;
-  FD_ZERO(&rfds);
-  FD_SET(lst, &rfds);
-  timeval tv{};
-  tv.tv_sec = acceptTimeoutMs / 1000;
-  tv.tv_usec = (acceptTimeoutMs % 1000) * 1000;
-  if (select(lst + 1, &rfds, nullptr, nullptr, &tv) <= 0) {
-    close(lst);
-    return r;
-  }
-  int fd = accept(lst, nullptr, nullptr);
-  close(lst);
-  if (fd < 0) return r;
-  tuneSocket(fd);
+  int lst = -1;
+  if (mcclSocketListen(port, 1, &lst, nullptr) != mcclSuccess) return r;
+  int fd = -1;
+  const mcclResult arc = mcclSocketAccept(lst, acceptTimeoutMs, &fd);
+  mcclSocketClose(lst);
+  if (arc != mcclSuccess) return r;
   timeval rcvto{};
-  rcvto.tv_sec = 10;
+  rcvto.tv_sec = 10;  // measurement stream: a stalled sender ends the sample, it doesn't hang the rank
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
 
   std::vector<char> buf(kBufBytes);
@@ -110,11 +55,12 @@ mcclBandwidthResult mcclBandwidthServe(uint16_t port, int acceptTimeoutMs) {
   const auto t0 = std::chrono::steady_clock::now();
   for (;;) {
     ssize_t n = recv(fd, buf.data(), buf.size(), 0);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) break;
     total += static_cast<uint64_t>(n);
   }
   r.seconds = secondsSince(t0);
-  close(fd);
+  mcclSocketClose(fd);
 
   r.bytes = total;
   r.gbps = r.seconds > 0 ? static_cast<double>(total) / 1e9 / r.seconds : 0.0;
@@ -124,29 +70,21 @@ mcclBandwidthResult mcclBandwidthServe(uint16_t port, int acceptTimeoutMs) {
 
 mcclBandwidthResult mcclBandwidthProbe(const char* host, uint16_t port, int durationMs) {
   mcclBandwidthResult r;
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return r;
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  if (inet_pton(AF_INET, host, &addr.sin_addr) != 1 || !connectTimeout(fd, addr, 5000)) {
-    close(fd);
-    return r;
-  }
-  tuneSocket(fd);
+  int fd = -1;
+  if (mcclSocketConnect(host, port, 5000, 0, &fd) != mcclSuccess) return r;
 
   std::vector<char> buf(kBufBytes, 0);
   uint64_t total = 0;
   const auto t0 = std::chrono::steady_clock::now();
   while (secondsSince(t0) * 1000.0 < durationMs) {
     ssize_t n = send(fd, buf.data(), buf.size(), 0);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) break;
     total += static_cast<uint64_t>(n);
   }
   r.seconds = secondsSince(t0);
   shutdown(fd, SHUT_WR);
-  close(fd);
+  mcclSocketClose(fd);
 
   r.bytes = total;
   r.gbps = r.seconds > 0 ? static_cast<double>(total) / 1e9 / r.seconds : 0.0;
@@ -237,7 +175,11 @@ mcclResult mcclCalibrateTbLinks(mcclTopoSystem* sys, const mcclEdge* edges, int 
 
   int tok = rank;
   std::vector<int> bar(static_cast<size_t>(nRanks));
-  MCCLCHECK(mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, &tok, bar.data(), sizeof(int)));  // barrier: servers up before clients dial
+  const mcclResult brc = mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, &tok, bar.data(), sizeof(int));  // barrier: servers up before clients dial
+  if (brc != mcclSuccess) {  // join (servers exit on their own accept timeout) — destructing a joinable std::thread is std::terminate
+    for (std::thread& t : servers) t.join();
+    return brc;
+  }
 
   std::vector<double> mine(static_cast<size_t>(nEdges), 0.0);
   for (int i = 0; i < nEdges; ++i)

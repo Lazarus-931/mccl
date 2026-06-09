@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -96,6 +97,19 @@ void keepAlive(int fd) {  // so a blocking recv unblocks if the peer dies (socke
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
 }
 
+// SOCKET_BUF_KB is a PER-CONNECTION budget: split it across the stripe set. K stripes each at the full budget
+// ask the kernel for K x the memory per peer — a many-children hub (or a many-rank loopback) exhausts mbufs and
+// the whole transport thrashes. The aggregate per connection (what keeps the TB link full) stays the same.
+// Must be applied at socket creation (dialer) / on the listener (acceptor): see socket.h's bufBytes contract.
+int stripeBufBytes(int nSocks) {
+  const int kb = static_cast<int>(mcclParamSocketBufKB());
+  if (kb <= 0) return 0;  // 0 = leave the OS default
+  if (nSocks <= 1) return kb * 1024;
+  int b = (kb * 1024) / nSocks;
+  if (b < 65536) b = 65536;
+  return b;
+}
+
 mcclM2M* newTcp(int* fds, int nSocks) {
   mcclM2M* m = new mcclM2M();
   m->res.type = M2M_TYPE_TCP;
@@ -116,7 +130,8 @@ mcclResult tcpConnectN(const char* peerIp, uint16_t port, int nSocks, mcclM2M** 
   const uint32_t connId = nextConnId();
   for (int i = 0; i < nSocks; ++i) {
     StripeHdr h{connId, static_cast<uint32_t>(i), M2M_TYPE_TCP};
-    if (mcclSocketConnect(peerIp, port, static_cast<int>(mcclParamConnectTimeoutMs()), kConnectRetries, &fds[i]) != mcclSuccess ||
+    if (mcclSocketConnect(peerIp, port, static_cast<int>(mcclParamConnectTimeoutMs()), kConnectRetries, &fds[i],
+                          stripeBufBytes(nSocks)) != mcclSuccess ||
         mcclSocketSend(fds[i], &h, sizeof(h)) != mcclSuccess) {
       closeFds(fds, nSocks);
       return mcclSystemError;
@@ -134,7 +149,7 @@ mcclResult acceptStripedSet(int lst, int nSocks, mcclM2M** out) {
   for (int i = 0; i < nSocks; ++i) {
     int fd = -1;
     StripeHdr h{};
-    if ((rc = mcclSocketAccept(lst, static_cast<int>(mcclParamAcceptTimeoutMs()), &fd)) != mcclSuccess) break;
+    if ((rc = mcclSocketAccept(lst, static_cast<int>(mcclParamAcceptTimeoutMs()), &fd, 0)) != mcclSuccess) break;  // 0: keep the listener-inherited stripe-split buffers
     if ((rc = mcclSocketRecv(fd, &h, sizeof(h))) != mcclSuccess) { mcclSocketClose(fd); break; }
     const uint32_t s = h.shard;
     if (static_cast<int>(s) >= nSocks || fds[s] != -1) { mcclSocketClose(fd); rc = mcclInternalError; break; }
@@ -148,7 +163,7 @@ mcclResult acceptStripedSet(int lst, int nSocks, mcclM2M** out) {
 
 mcclResult tcpListenN(uint16_t port, int nSocks, mcclM2M** out) {
   int lst = -1;
-  MCCLCHECK(mcclSocketListen(port, nSocks, &lst, nullptr));
+  MCCLCHECK(mcclSocketListen(port, nSocks, &lst, nullptr, stripeBufBytes(nSocks)));
   const mcclResult rc = acceptStripedSet(lst, nSocks, out);
   mcclSocketClose(lst);
   return rc;
@@ -280,7 +295,7 @@ mcclResult mcclM2MListenStart(uint16_t port, mcclM2MListener** out, uint16_t* bo
   *out = nullptr;
   const int nSocks = dataSocks();
   int lst = -1;
-  MCCLCHECK(mcclSocketListen(port, 256, &lst, boundPort));  // backlog >> nSocks: a hub gets (peers x nSocks) SYNs at once; 8 dropped them at scale
+  MCCLCHECK(mcclSocketListen(port, 256, &lst, boundPort, stripeBufBytes(nSocks)));  // backlog >> nSocks: a hub gets (peers x nSocks) SYNs at once; 8 dropped them at scale
   auto* l = new mcclM2MListener();
   l->lst = lst;
   l->nSocks = nSocks;
@@ -296,15 +311,24 @@ mcclResult mcclM2MAccept(mcclM2MListener* l, mcclM2M** out) {
   const int nSocks = l->nSocks;
   for (;;) {
     int fd = -1;
-    mcclResult rc = mcclSocketAccept(l->lst, static_cast<int>(mcclParamAcceptTimeoutMs()), &fd);
+    mcclResult rc = mcclSocketAccept(l->lst, static_cast<int>(mcclParamAcceptTimeoutMs()), &fd, 0);  // 0: keep the listener-inherited stripe-split buffers
     if (rc != mcclSuccess) return rc;
+    // Bound the header read and drop bad connections instead of failing: this listener is the comm's only
+    // accept path and stays open for its lifetime — a connected-but-silent socket (port scan, dialer that died
+    // pre-header) or a malformed header must not wedge or poison every future accept.
+    timeval hdrTo{};
+    hdrTo.tv_sec = static_cast<time_t>(mcclParamConnectTimeoutMs() / 1000);
+    hdrTo.tv_usec = static_cast<suseconds_t>((mcclParamConnectTimeoutMs() % 1000) * 1000);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &hdrTo, sizeof(hdrTo));
     StripeHdr h{};
-    if ((rc = mcclSocketRecv(fd, &h, sizeof(h))) != mcclSuccess) { mcclSocketClose(fd); return rc; }
+    if (mcclSocketRecv(fd, &h, sizeof(h)) != mcclSuccess) { mcclSocketClose(fd); continue; }
+    timeval noTo{};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &noTo, sizeof(noTo));  // data-path recvs may stall legitimately; keepalive covers peer death
     if (h.type == M2M_TYPE_RDMA) { rc = rdmaSetup(fd, out); mcclSocketClose(fd); return rc; }
-    if (static_cast<int>(h.shard) >= nSocks) { mcclSocketClose(fd); return mcclInternalError; }
+    if (static_cast<int>(h.shard) >= nSocks) { mcclSocketClose(fd); continue; }
     std::vector<int>& slots = l->partial[h.connId];
     if (slots.empty()) slots.assign(static_cast<size_t>(nSocks), -1);
-    if (slots[h.shard] != -1) { mcclSocketClose(fd); return mcclInternalError; }
+    if (slots[h.shard] != -1) { mcclSocketClose(fd); continue; }
     slots[h.shard] = fd;
     keepAlive(fd);
     bool full = true;
@@ -317,6 +341,13 @@ mcclResult mcclM2MAccept(mcclM2MListener* l, mcclM2M** out) {
       return mcclSuccess;
     }
   }
+}
+
+mcclResult mcclM2MListenShutdown(mcclM2MListener* l) {
+  if (l == nullptr) return mcclInvalidArgument;
+  if (l->lst >= 0) ::shutdown(l->lst, SHUT_RDWR);
+  for (auto& kv : l->partial) for (int fd : kv.second) if (fd != -1) ::shutdown(fd, SHUT_RDWR);
+  return mcclSuccess;
 }
 
 mcclResult mcclM2MListenClose(mcclM2MListener* l) {

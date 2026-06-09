@@ -96,7 +96,7 @@ inline mcclResult treeReduceScatter(mcclComm* comm, const void* sendbuff, void* 
   MCCLCHECK(mcclCommReserveScratch(comm, blk * static_cast<size_t>(n), &work));
   MCCLCHECK(mcclCommReserveStaging(comm, blk * static_cast<size_t>(n) * nc, &stg));
   std::memcpy(work, sendbuff, blk * static_cast<size_t>(n));
-  const bool gpu = mcclMetalAvailable() && pageAligned(work);
+  const bool gpu = pageAligned(work);  // Metal availability is probed lazily in reduceMulti, past the size gate
   const size_t whole = recvcount * static_cast<size_t>(n);
 
   mcclResult res = forEachChild(nc, [&](size_t k) {  // root: gather every leaf's full input (one link each), fold in one pass, scatter blocks

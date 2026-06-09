@@ -2,7 +2,6 @@
 
 #include "../socket.h"
 #include "../bootstrap.h"
-#include "../include/checks.h"
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -11,7 +10,6 @@
 #include <sys/socket.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <map>
@@ -87,10 +85,18 @@ mcclResult mcclProbeLiveness(std::vector<mcclEdge>& edges, int rank, int nRanks,
   const int nE = static_cast<int>(edges.size());
   if (nE == 0) return mcclSuccess;
 
+  // Serve only if some prober will dial us (we are the b endpoint of an edge): two same-host ranks would
+  // otherwise both bind probePort and the second would fail init for a server nobody needs.
+  bool needServer = false;
+  for (int i = 0; i < nE; ++i) if (edges[static_cast<size_t>(i)].b == rank) { needServer = true; break; }
   int lst = -1;
-  if (mcclSocketListen(probePort, 16, &lst, nullptr) != mcclSuccess) return mcclSystemError;
+  if (mcclSocketListen(probePort, 16, &lst, nullptr) != mcclSuccess) {
+    if (needServer) return mcclSystemError;
+    lst = -1;
+  }
   std::atomic<bool> stop{false};
-  std::thread server([&]() {
+  std::thread server;
+  if (lst >= 0) server = std::thread([&]() {
     while (!stop.load()) {
       int fd = -1;
       if (mcclSocketAccept(lst, 200, &fd) != mcclSuccess) continue;
@@ -117,13 +123,15 @@ mcclResult mcclProbeLiveness(std::vector<mcclEdge>& edges, int rank, int nRanks,
     vote[static_cast<size_t>(i)] = live ? 1 : 2;
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  stop.store(true);
-  server.join();
-  mcclSocketClose(lst);
-
+  // Serve until the vote all-gather completes — it only returns once EVERY rank has finished probing, so no
+  // fixed grace window can cut off a slow prober (a rank with several dead edges probes for many seconds,
+  // and a 500ms window falsely marked its live edges dead).
   std::vector<uint8_t> all(static_cast<size_t>(nRanks) * static_cast<size_t>(nE), 0);
-  MCCLCHECK(mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, vote.data(), all.data(), static_cast<size_t>(nE)));
+  const mcclResult arc = mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, vote.data(), all.data(), static_cast<size_t>(nE));
+  stop.store(true);
+  if (server.joinable()) server.join();
+  mcclSocketClose(lst);
+  if (arc != mcclSuccess) return arc;
   for (int i = 0; i < nE; ++i)
     edges[static_cast<size_t>(i)].live = (all[static_cast<size_t>(edges[i].a) * static_cast<size_t>(nE) + i] == 1);
   return mcclSuccess;
