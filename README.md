@@ -10,6 +10,9 @@ fastest for the size — then runs the reduction on the GPU over unified memory 
 Much of inspiration came from [nccl](https://github.com/NVIDIA/nccl/tree/73cf112295c33aee2b895f329f592f2a9b4b0f97#)
 
 
+__UPDATE__: With wwdc26 came fp8 and fp4 support for m5, will be supporting that soon!
+
+
 ## Build
 
 Requirements: macOS on Apple Silicon (Metal), a C++17 `clang++`, and CMake ≥ 3.20. The Macs are wired by
