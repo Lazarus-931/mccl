@@ -15,6 +15,11 @@ mcclResult mcclReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuf
 mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, int root);
 mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op, int root);
 
+// Each rank scatters its sendbuff (nRanks chunks of `count` elements) to every rank and gathers a chunk
+// from each into recvbuff, both indexed by rank. No reduction; a direct N-by-N exchange over the grouped
+// Send/Recv batch. sendbuff and recvbuff each hold count*nRanks elements.
+mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt);
+
 // Point-to-point to an arbitrary peer. Wrap in mcclGroupStart/End to run a batch (all-to-all, scatter/gather,
 // bidirectional exchange) concurrently and deadlock-free; ungrouped, each call is one blocking transfer.
 mcclResult mcclSend(mcclComm* comm, const void* sendbuff, size_t count, mcclDataType dt, int peer);
