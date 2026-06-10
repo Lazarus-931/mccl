@@ -44,7 +44,7 @@ inline mcclResult treeReduce(mcclComm* comm, const void* sendbuff, void* recvbuf
     if (me == hub)  { rc = mcclEnsurePeerConns(comm, {root}); const auto it = comm->peerConns.find(root); if (rc == mcclSuccess) rc = (it != comm->peerConns.end()) ? mcclM2MSend(it->second, work, count * esz) : mcclInternalError; }
     if (me == root) { rc = mcclEnsurePeerConns(comm, {hub});  const auto it = comm->peerConns.find(hub);  if (rc == mcclSuccess) rc = (it != comm->peerConns.end()) ? mcclM2MRecv(it->second, recvbuff, count * esz) : mcclInternalError; }
   }
-  if (rc == mcclSuccess && op == mcclAvg && me == root) rc = cpuScale(recvbuff, count, dt, 1.0 / n);
+  if (rc == mcclSuccess && op == mcclAvg && me == root) rc = scaleBuf(recvbuff, count, dt, 1.0 / n);
   return rc;
 }
 

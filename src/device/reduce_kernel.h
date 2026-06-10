@@ -8,6 +8,7 @@
 
 #include "../definitions.h"
 #include "../include/param.h"
+#include "../pool.h"
 #include "metal.h"
 
 namespace mccl {
@@ -46,6 +47,48 @@ inline void cpuReduceBf16(uint16_t* d, const uint16_t* s, size_t n, mcclRedOp op
       default: break;
     }
     d[i] = mcclF32ToBf16(r);
+  }
+}
+
+template <typename T>
+inline void cpuReduceOutT(T* d, const T* a, const T* b, size_t n, mcclRedOp op) {
+  switch (op) {
+    case mcclSum:  for (size_t i = 0; i < n; ++i) d[i] = a[i] + b[i]; break;
+    case mcclProd: for (size_t i = 0; i < n; ++i) d[i] = a[i] * b[i]; break;
+    case mcclMax:  for (size_t i = 0; i < n; ++i) d[i] = a[i] > b[i] ? a[i] : b[i]; break;
+    case mcclMin:  for (size_t i = 0; i < n; ++i) d[i] = a[i] < b[i] ? a[i] : b[i]; break;
+    default: break;
+  }
+}
+
+inline void cpuReduceOutBf16(uint16_t* d, const uint16_t* a, const uint16_t* b, size_t n, mcclRedOp op) {
+  for (size_t i = 0; i < n; ++i) {
+    const float x = mcclBf16ToF32(a[i]), y = mcclBf16ToF32(b[i]);
+    float r = x;
+    switch (op) {
+      case mcclSum:  r = x + y; break;
+      case mcclProd: r = x * y; break;
+      case mcclMax:  r = x > y ? x : y; break;
+      case mcclMin:  r = x < y ? x : y; break;
+      default: break;
+    }
+    d[i] = mcclF32ToBf16(r);
+  }
+}
+
+inline mcclResult reduceOut(void* d, const void* a, const void* b, size_t n, mcclDataType dt, mcclRedOp op) {
+  switch (dt) {
+    case mcclFloat32: cpuReduceOutT(static_cast<float*>(d),    static_cast<const float*>(a),    static_cast<const float*>(b),    n, op); return mcclSuccess;
+    case mcclFloat64: cpuReduceOutT(static_cast<double*>(d),   static_cast<const double*>(a),   static_cast<const double*>(b),   n, op); return mcclSuccess;
+    case mcclInt8:    cpuReduceOutT(static_cast<int8_t*>(d),   static_cast<const int8_t*>(a),   static_cast<const int8_t*>(b),   n, op); return mcclSuccess;
+    case mcclUint8:   cpuReduceOutT(static_cast<uint8_t*>(d),  static_cast<const uint8_t*>(a),  static_cast<const uint8_t*>(b),  n, op); return mcclSuccess;
+    case mcclInt32:   cpuReduceOutT(static_cast<int32_t*>(d),  static_cast<const int32_t*>(a),  static_cast<const int32_t*>(b),  n, op); return mcclSuccess;
+    case mcclUint32:  cpuReduceOutT(static_cast<uint32_t*>(d), static_cast<const uint32_t*>(a), static_cast<const uint32_t*>(b), n, op); return mcclSuccess;
+    case mcclInt64:   cpuReduceOutT(static_cast<int64_t*>(d),  static_cast<const int64_t*>(a),  static_cast<const int64_t*>(b),  n, op); return mcclSuccess;
+    case mcclUint64:  cpuReduceOutT(static_cast<uint64_t*>(d), static_cast<const uint64_t*>(a), static_cast<const uint64_t*>(b), n, op); return mcclSuccess;
+    case mcclFloat16:  cpuReduceOutT(static_cast<_Float16*>(d), static_cast<const _Float16*>(a), static_cast<const _Float16*>(b), n, op); return mcclSuccess;
+    case mcclBfloat16: cpuReduceOutBf16(static_cast<uint16_t*>(d), static_cast<const uint16_t*>(a), static_cast<const uint16_t*>(b), n, op); return mcclSuccess;
+    default: return mcclInvalidArgument;
   }
 }
 
@@ -104,6 +147,19 @@ inline mcclResult reduceMulti(void* dst, const void* srcBase, size_t count, size
 
 inline size_t chunkOffElems(size_t count, int n, int i) {
   return count * static_cast<size_t>(i) / static_cast<size_t>(n);
+}
+
+inline mcclResult cpuScale(void* buf, size_t count, mcclDataType dt, double factor);
+
+inline mcclResult scaleBuf(void* buf, size_t count, mcclDataType dt, double factor) {
+  const size_t esz = mcclDataSize(dt);
+  if (esz == 0) return mcclInvalidUsage;
+  if (count * esz < (4u << 20)) return cpuScale(buf, count, dt, factor);
+  const size_t chunks = 8;
+  return mcclParallel(mcclFanoutPool(), chunks, [&](size_t k) {
+    const size_t lo = count * k / chunks, hi = count * (k + 1) / chunks;
+    return cpuScale(static_cast<char*>(buf) + lo * esz, hi - lo, dt, factor);
+  });
 }
 
 inline mcclResult cpuScale(void* buf, size_t count, mcclDataType dt, double factor) {

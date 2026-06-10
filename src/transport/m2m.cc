@@ -81,7 +81,7 @@ namespace {
 DEFINE_MCCL_PARAM(ConnectTimeoutMs, "CONNECT_TIMEOUT_MS", 5000);
 DEFINE_MCCL_PARAM(AcceptTimeoutMs,  "ACCEPT_TIMEOUT_MS",  30000);
 DEFINE_MCCL_PARAM(KeepAliveIdleSec, "KEEPALIVE_IDLE_SEC", 10);
-DEFINE_MCCL_PARAM(NSocks,           "NSOCKS",             8);          // sockets per connection (measured best on TB; >=12 stalls connection setup)
+DEFINE_MCCL_PARAM(NSocks,           "NSOCKS",             4);          // sockets per connection (measured best on TB; >=12 stalls connection setup)
 DEFINE_MCCL_PARAM(StripeMinBytes,   "STRIPE_MIN_BYTES",   1 << 18);    // below this, one socket: striping's thread-spawn costs more than it saves
 
 constexpr int kConnectRetries = 50;

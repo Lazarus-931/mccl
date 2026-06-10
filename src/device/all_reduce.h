@@ -2,14 +2,54 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <thread>
+#include <vector>
 
 #include "primitives.h"
 #include "reduce_kernel.h"
+#include "../include/checks.h"
 #include "../include/comm.h"
 #include "../transport/m2m.h"
 
 namespace mccl {
+
+inline mcclResult directAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
+  const size_t esz = mcclDataSize(dt);
+  if (esz == 0 || count == 0) return mcclInvalidArgument;
+  const int n = comm->nRanks, r = comm->rank;
+  const mcclRedOp wireOp = (op == mcclAvg) ? mcclSum : op;
+  const size_t bytes = count * esz;
+  if (n == 1) {
+    if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, bytes);
+    return mcclSuccess;
+  }
+
+  std::set<int> peers;
+  for (int p = 0; p < n; ++p) if (p != r) peers.insert(p);
+  MCCLCHECK(mcclEnsurePeerConns(comm, peers));
+  void* stg = nullptr;
+  MCCLCHECK(mcclCommReserveStaging(comm, bytes * static_cast<size_t>(n - 1), &stg));
+
+  std::vector<mcclM2M*> conns;
+  conns.reserve(static_cast<size_t>(n - 1));
+  for (int p : peers) {
+    const auto it = comm->peerConns.find(p);
+    if (it == comm->peerConns.end() || it->second == nullptr) return mcclInternalError;
+    conns.push_back(it->second);
+  }
+  char* stgB = static_cast<char*>(stg);
+  const mcclResult rc = mcclParallel(mcclFanoutPool(), 2 * static_cast<size_t>(n - 1), [&](size_t k) {
+    mcclM2M* c = conns[k / 2];
+    return (k & 1) ? mcclM2MSend(c, sendbuff, bytes)
+                   : mcclM2MRecv(c, stgB + (k / 2) * bytes, bytes);
+  });
+  if (rc != mcclSuccess) return rc;
+
+  if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, bytes);
+  MCCLCHECK(reduceMulti(recvbuff, stg, count, static_cast<size_t>(n - 1), count, dt, wireOp, false));
+  return op == mcclAvg ? cpuScale(recvbuff, count, dt, 1.0 / n) : mcclSuccess;
+}
 
 // Ring all-reduce = reduce-scatter (each step sends one chunk, receives + reduces another) then all-gather.
 inline mcclResult ringAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
@@ -36,7 +76,7 @@ inline mcclResult ringAllReduce(mcclComm* comm, const void* sendbuff, void* recv
     rc = prims.recvCopySend(chunkOffElems(count, n, s), chunkOffElems(count, n, s + 1) - chunkOffElems(count, n, s),
                             chunkOffElems(count, n, d), chunkOffElems(count, n, d + 1) - chunkOffElems(count, n, d));
   }
-  if (rc == mcclSuccess && op == mcclAvg) rc = cpuScale(recvbuff, count, dt, 1.0 / n);
+  if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, count, dt, 1.0 / n);
   return rc;
 }
 
@@ -82,7 +122,7 @@ inline mcclResult treeAllReduce(mcclComm* comm, const void* sendbuff, void* recv
     const mcclResult rA = oneTree(pA, 0, hA);
     t.join();
     mcclResult rc = rA != mcclSuccess ? rA : rB;
-    if (rc == mcclSuccess && op == mcclAvg) rc = cpuScale(recvbuff, count, dt, 1.0 / comm->nRanks);
+    if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, count, dt, 1.0 / comm->nRanks);
     return rc;
   }
 
@@ -118,7 +158,7 @@ inline mcclResult treeAllReduce(mcclComm* comm, const void* sendbuff, void* recv
     if (t.joinable()) t.join();
     rc = drc != mcclSuccess ? drc : urc;
   }
-  if (rc == mcclSuccess && op == mcclAvg) rc = cpuScale(recvbuff, count, dt, 1.0 / comm->nRanks);
+  if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, count, dt, 1.0 / comm->nRanks);
   return rc;
 }
 
