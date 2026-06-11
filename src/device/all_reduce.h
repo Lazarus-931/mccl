@@ -29,25 +29,33 @@ inline mcclResult directAllReduce(mcclComm* comm, const void* sendbuff, void* re
   for (int p = 0; p < n; ++p) if (p != r) peers.insert(p);
   MCCLCHECK(mcclEnsurePeerConns(comm, peers));
   void* stg = nullptr;
-  MCCLCHECK(mcclCommReserveStaging(comm, bytes * static_cast<size_t>(n - 1), &stg));
+  MCCLCHECK(mcclCommReserveStaging(comm, bytes * static_cast<size_t>(n), &stg));
 
   std::vector<mcclM2M*> conns;
+  std::vector<int> peerRank;
   conns.reserve(static_cast<size_t>(n - 1));
+  peerRank.reserve(static_cast<size_t>(n - 1));
   for (int p : peers) {
     const auto it = comm->peerConns.find(p);
     if (it == comm->peerConns.end() || it->second == nullptr) return mcclInternalError;
     conns.push_back(it->second);
+    peerRank.push_back(p);
   }
+  // Slot k holds rank k's buffer (own rank included) so the fold below visits contributions in
+  // ascending-rank order on EVERY rank. Folding starting from the local buffer instead makes the
+  // fp association differ per rank (rank 2 computes (x2+x0)+x1 while rank 0 computes (x0+x1)+x2),
+  // which leaves ranks' results a ULP apart and lets long DDP runs drift.
   char* stgB = static_cast<char*>(stg);
   const mcclResult rc = mcclParallel(mcclFanoutPool(), 2 * static_cast<size_t>(n - 1), [&](size_t k) {
     mcclM2M* c = conns[k / 2];
     return (k & 1) ? mcclM2MSend(c, sendbuff, bytes)
-                   : mcclM2MRecv(c, stgB + (k / 2) * bytes, bytes);
+                   : mcclM2MRecv(c, stgB + static_cast<size_t>(peerRank[k / 2]) * bytes, bytes);
   });
   if (rc != mcclSuccess) return rc;
 
-  if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, bytes);
-  MCCLCHECK(reduceMulti(recvbuff, stg, count, static_cast<size_t>(n - 1), count, dt, wireOp, false));
+  std::memcpy(stgB + static_cast<size_t>(r) * bytes, sendbuff, bytes);
+  std::memcpy(recvbuff, stgB, bytes);
+  MCCLCHECK(reduceMulti(recvbuff, stgB + bytes, count, static_cast<size_t>(n - 1), count, dt, wireOp, false));
   return op == mcclAvg ? cpuScale(recvbuff, count, dt, 1.0 / n) : mcclSuccess;
 }
 
