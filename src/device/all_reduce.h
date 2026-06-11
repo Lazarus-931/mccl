@@ -59,10 +59,7 @@ inline mcclResult directAllReduce(mcclComm* comm, const void* sendbuff, void* re
   return op == mcclAvg ? cpuScale(recvbuff, count, dt, 1.0 / n) : mcclSuccess;
 }
 
-// One ring leg over [buf, buf + count): the classic n-1 reduce-scatter steps + n-1 all-gather steps.
-// dir=+1 walks rank+1 over prev/next; dir=-1 walks rank-1 (chunk indices mirror with the sign), so two legs
-// with disjoint sockets drive both directions of every link at once. The schedule is in rank space, which is
-// valid because the ring search emits rank order (search.cc); a max-bw reordered ring must map via userRanks.
+
 inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt, mcclRedOp op,
                                    int dir, mcclM2M* prev, mcclM2M* next, void* stg, size_t stgStride) {
   const int n = comm->nRanks, r = comm->rank;
@@ -84,9 +81,7 @@ inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mccl
   return rc;
 }
 
-// Ring all-reduce = reduce-scatter (each step sends one chunk, receives + reduces another) then all-gather.
-// With dual rings the buffer splits in half and the two halves counter-rotate concurrently: a single ring
-// drives each link in one direction only, so the reverse capacity is free bandwidth (TB is full-duplex).
+
 inline mcclResult ringAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || count == 0) return mcclInvalidArgument;
