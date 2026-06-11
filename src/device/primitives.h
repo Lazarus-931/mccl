@@ -29,12 +29,15 @@ class Primitives {
 
   void bindTree(mcclM2M* parent, const std::vector<mcclM2M*>* children, void* staging, size_t stagingStride);
 
+  // Rebind the ring endpoints (counter-rotating legs run one Primitives per direction over disjoint sockets
+  // and disjoint staging). Defaults are comm->prev/comm->next.
+  void bindRing(mcclM2M* prev, mcclM2M* next, void* staging, size_t stagingStride);
+
   mcclResult sendRecv(const void* sp, size_t sbytes, void* rp, size_t rbytes);
   mcclResult sendNext(const void* p, size_t bytes);
   mcclResult recvPrev(void* p, size_t bytes);
 
  private:
-  mcclComm*    comm_;
   char*        buf_;
   mcclDataType dt_;
   mcclRedOp    op_;
@@ -45,6 +48,8 @@ class Primitives {
   size_t       stagingStride_;
   mcclM2M*                     tParent_;
   const std::vector<mcclM2M*>* tChildren_;
+  mcclM2M*                     rPrev_;
+  mcclM2M*                     rNext_;
 };
 
 }

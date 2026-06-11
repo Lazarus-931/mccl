@@ -59,30 +59,72 @@ inline mcclResult directAllReduce(mcclComm* comm, const void* sendbuff, void* re
   return op == mcclAvg ? cpuScale(recvbuff, count, dt, 1.0 / n) : mcclSuccess;
 }
 
+// One ring leg over [buf, buf + count): the classic n-1 reduce-scatter steps + n-1 all-gather steps.
+// dir=+1 walks rank+1 over prev/next; dir=-1 walks rank-1 (chunk indices mirror with the sign), so two legs
+// with disjoint sockets drive both directions of every link at once. The schedule is in rank space, which is
+// valid because the ring search emits rank order (search.cc); a max-bw reordered ring must map via userRanks.
+inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt, mcclRedOp op,
+                                   int dir, mcclM2M* prev, mcclM2M* next, void* stg, size_t stgStride) {
+  const int n = comm->nRanks, r = comm->rank;
+  Primitives prims(comm, buf, dt, op, 0);
+  if (!prims.ok()) return mcclSystemError;
+  prims.bindRing(prev, next, stg, stgStride);
+  auto wrap = [n](int x) { return ((x % n) + n) % n; };
+  auto off = [&](int c) { return chunkOffElems(count, n, c); };
+  auto len = [&](int c) { return chunkOffElems(count, n, c + 1) - chunkOffElems(count, n, c); };
+  mcclResult rc = mcclSuccess;
+  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
+    const int s = wrap(r - dir * i), d = wrap(r - dir * (i + 1));
+    rc = prims.recvReduceSend(off(s), len(s), off(d), len(d));
+  }
+  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
+    const int s = wrap(r - dir * (i - 1)), d = wrap(r - dir * i);
+    rc = prims.recvCopySend(off(s), len(s), off(d), len(d));
+  }
+  return rc;
+}
+
 // Ring all-reduce = reduce-scatter (each step sends one chunk, receives + reduces another) then all-gather.
+// With dual rings the buffer splits in half and the two halves counter-rotate concurrently: a single ring
+// drives each link in one direction only, so the reverse capacity is free bandwidth (TB is full-duplex).
 inline mcclResult ringAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op) {
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || count == 0) return mcclInvalidArgument;
-  const int n = comm->nRanks, r = comm->rank;
+  const int n = comm->nRanks;
   const mcclRedOp ringOp = (op == mcclAvg) ? mcclSum : op;  // sum on the wire, scale to the average at the end
   if (sendbuff != recvbuff) std::memcpy(recvbuff, sendbuff, count * esz);
   if (n == 1) return mcclSuccess;
 
-  size_t maxEl = 0;
-  for (int i = 0; i < n; ++i) maxEl = std::max(maxEl, chunkOffElems(count, n, i + 1) - chunkOffElems(count, n, i));
-  Primitives prims(comm, recvbuff, dt, ringOp, maxEl * esz);
-  if (!prims.ok()) return mcclSystemError;
+  auto maxChunkEl = [&](size_t cnt) {
+    size_t m = 0;
+    for (int i = 0; i < n; ++i) m = std::max(m, chunkOffElems(cnt, n, i + 1) - chunkOffElems(cnt, n, i));
+    return m;
+  };
 
-  mcclResult rc = mcclSuccess;
-  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
-    const int s = (r - i + n) % n, d = (r - i - 1 + n) % n;
-    rc = prims.recvReduceSend(chunkOffElems(count, n, s), chunkOffElems(count, n, s + 1) - chunkOffElems(count, n, s),
-                              chunkOffElems(count, n, d), chunkOffElems(count, n, d + 1) - chunkOffElems(count, n, d));
-  }
-  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
-    const int s = (r - i + 1 + n) % n, d = (r - i + n) % n;
-    rc = prims.recvCopySend(chunkOffElems(count, n, s), chunkOffElems(count, n, s + 1) - chunkOffElems(count, n, s),
-                            chunkOffElems(count, n, d), chunkOffElems(count, n, d + 1) - chunkOffElems(count, n, d));
+  const bool dual = comm->nextB != nullptr && comm->prevB != nullptr && n >= 3 &&
+                    count * esz >= static_cast<size_t>(mcclParamDualRingMinBytes()) &&
+                    count >= static_cast<size_t>(2 * n);
+  mcclResult rc;
+  if (dual) {
+    const size_t hA = count / 2, hB = count - hA;
+    const size_t maxA = maxChunkEl(hA), maxB = maxChunkEl(hB);
+    void* stg = nullptr;
+    if (mcclCommReserveStaging(comm, (maxA + maxB) * esz, &stg) != mcclSuccess) return mcclSystemError;
+    mcclResult rB = mcclSuccess;
+    // Reverse leg: downstream is the forward ring's prev rank, reached over the B sockets.
+    std::thread t([&]() {
+      rB = ringAllReduceLeg(comm, static_cast<char*>(recvbuff) + hA * esz, hB, dt, ringOp, -1,
+                            comm->nextB, comm->prevB, static_cast<char*>(stg) + maxA * esz, maxB * esz);
+    });
+    const mcclResult rA = ringAllReduceLeg(comm, recvbuff, hA, dt, ringOp, +1,
+                                           comm->prev, comm->next, stg, maxA * esz);
+    t.join();
+    rc = rA != mcclSuccess ? rA : rB;
+  } else {
+    const size_t maxEl = maxChunkEl(count);
+    void* stg = nullptr;
+    if (mcclCommReserveStaging(comm, maxEl * esz, &stg) != mcclSuccess) return mcclSystemError;
+    rc = ringAllReduceLeg(comm, recvbuff, count, dt, ringOp, +1, comm->prev, comm->next, stg, maxEl * esz);
   }
   if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, count, dt, 1.0 / n);
   return rc;

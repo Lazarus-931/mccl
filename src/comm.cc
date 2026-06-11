@@ -44,6 +44,9 @@ struct RankInfo {
 thread_local mcclResult g_lastError = mcclSuccess;
 }
 
+DEFINE_MCCL_PARAM(DualRings, "DUAL_RINGS", 1);
+DEFINE_MCCL_PARAM(DualRingMinBytes, "DUAL_RING_MIN_BYTES", int64_t{1} << 20);
+
 mcclResult mcclGetUniqueId(mcclUniqueId* id) {
   if (id == nullptr) return mcclInvalidArgument;
   IdData d{};
@@ -165,22 +168,35 @@ mcclResult mcclCommInitRankConfig(mcclComm** out, int nRanks, mcclUniqueId commI
       comm->childConns.clear();
       for (int d : ch.tree.down) comm->childConns.push_back(comm->peerConns.at(d));
     }
-    if (useTree && ch.dtree) {
-      // The second tree gets its own connections (peerConnsB) so the two trees can run concurrently without
-      // sharing a socket. The barrier guarantees every rank finished the first tree's setup before anyone
-      // dials the second, so the listener can't misroute a tree-B socket into the tree-A accept loop.
+    // Second-direction connections (peerConnsB): the reverse ring leg and tree B each get their own sockets
+    // so concurrent legs never share one. The barrier guarantees every rank finished the first batch's setup
+    // before anyone dials the second, so the listener can't misroute a B socket into the first accept loop.
+    // n == 2 needs no reverse leg: the single forward leg already drives that one link in both directions.
+    const bool wantRingB = useRing && nRanks >= 3 && mcclParamDualRings() != 0 &&
+                           ch.ring.next >= 0 && ch.ring.prev >= 0;
+    const bool wantTreeB = useTree && ch.dtree;
+    if (wantRingB || wantTreeB) {
       std::set<int> peersB;
-      if (ch.treeB.up >= 0) peersB.insert(ch.treeB.up);
-      for (int d : ch.treeB.down) peersB.insert(d);
+      if (wantRingB) { peersB.insert(ch.ring.next); peersB.insert(ch.ring.prev); }
+      if (wantTreeB) {
+        if (ch.treeB.up >= 0) peersB.insert(ch.treeB.up);
+        for (int d : ch.treeB.down) peersB.insert(d);
+      }
       int tok = rank;
       std::vector<int> bar(static_cast<size_t>(nRanks));
       rc = mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, &tok, bar.data(), sizeof(int));
       if (rc == mcclSuccess) rc = mcclEnsurePeerConnsInto(comm, peersB, comm->peerConnsB);
       if (rc != mcclSuccess) { mcclCommDestroy(comm); return rc; }
-      comm->parentB = ch.treeB.up >= 0 ? comm->peerConnsB.at(ch.treeB.up) : nullptr;
-      comm->childRanksB = ch.treeB.down;
-      comm->childConnsB.clear();
-      for (int d : ch.treeB.down) comm->childConnsB.push_back(comm->peerConnsB.at(d));
+      if (wantRingB) {
+        comm->nextB = comm->peerConnsB.at(ch.ring.next);
+        comm->prevB = comm->peerConnsB.at(ch.ring.prev);
+      }
+      if (wantTreeB) {
+        comm->parentB = ch.treeB.up >= 0 ? comm->peerConnsB.at(ch.treeB.up) : nullptr;
+        comm->childRanksB = ch.treeB.down;
+        comm->childConnsB.clear();
+        for (int d : ch.treeB.down) comm->childConnsB.push_back(comm->peerConnsB.at(d));
+      }
     }
   }
 

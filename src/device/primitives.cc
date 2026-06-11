@@ -13,8 +13,7 @@ DEFINE_MCCL_PARAM(MetalMinBytes, "METAL_MIN_BYTES", int64_t{1} << 62);
 DEFINE_MCCL_PARAM(PipelineChunks, "PIPELINE_CHUNKS", 4);
 
 Primitives::Primitives(mcclComm* comm, void* buf, mcclDataType dt, mcclRedOp op, size_t maxChunkBytes)
-    : comm_(comm),
-      buf_(static_cast<char*>(buf)),
+    : buf_(static_cast<char*>(buf)),
       dt_(dt),
       op_(op),
       esz_(mcclDataSize(dt)),
@@ -23,7 +22,9 @@ Primitives::Primitives(mcclComm* comm, void* buf, mcclDataType dt, mcclRedOp op,
       staging_(nullptr),
       stagingStride_(maxChunkBytes),
       tParent_(comm->parent),
-      tChildren_(&comm->childConns) {
+      tChildren_(&comm->childConns),
+      rPrev_(comm->prev),
+      rNext_(comm->next) {
   // One staging slice per child so a hub can receive from all children at once, then fold them in a single
   // pass. Borrowed from the comm's persistent scratch. maxChunkBytes==0 means the caller will bindTree its own.
   const size_t slices = comm->childConns.empty() ? 1 : comm->childConns.size();
@@ -37,12 +38,19 @@ void Primitives::bindTree(mcclM2M* parent, const std::vector<mcclM2M*>* children
   stagingStride_ = stagingStride;
 }
 
+void Primitives::bindRing(mcclM2M* prev, mcclM2M* next, void* staging, size_t stagingStride) {
+  rPrev_ = prev;
+  rNext_ = next;
+  staging_ = staging;
+  stagingStride_ = stagingStride;
+}
+
 Primitives::~Primitives() {}
 
 mcclResult Primitives::recvReduceSend(size_t sendOff, size_t sendCnt, size_t recvOff, size_t recvCnt) {
   const mcclResult rc = mcclParallel(mcclFanoutPool(), 2, [&](size_t k) {
-    return k == 0 ? mcclM2MRecv(comm_->prev, staging_, recvCnt * esz_)
-                  : mcclM2MSend(comm_->next, buf_ + sendOff * esz_, sendCnt * esz_);
+    return k == 0 ? mcclM2MRecv(rPrev_, staging_, recvCnt * esz_)
+                  : mcclM2MSend(rNext_, buf_ + sendOff * esz_, sendCnt * esz_);
   });
   if (rc != mcclSuccess) return rc;
   return reduce(buf_ + recvOff * esz_, staging_, recvCnt, dt_, op_, gpu_);
@@ -50,8 +58,8 @@ mcclResult Primitives::recvReduceSend(size_t sendOff, size_t sendCnt, size_t rec
 
 mcclResult Primitives::recvCopySend(size_t sendOff, size_t sendCnt, size_t recvOff, size_t recvCnt) {
   return mcclParallel(mcclFanoutPool(), 2, [&](size_t k) {
-    return k == 0 ? mcclM2MRecv(comm_->prev, buf_ + recvOff * esz_, recvCnt * esz_)
-                  : mcclM2MSend(comm_->next, buf_ + sendOff * esz_, sendCnt * esz_);
+    return k == 0 ? mcclM2MRecv(rPrev_, buf_ + recvOff * esz_, recvCnt * esz_)
+                  : mcclM2MSend(rNext_, buf_ + sendOff * esz_, sendCnt * esz_);
   });
 }
 
@@ -84,12 +92,12 @@ mcclResult Primitives::sendToChildren(size_t off, size_t cnt) {
 
 mcclResult Primitives::sendRecv(const void* sp, size_t sbytes, void* rp, size_t rbytes) {
   return mcclParallel(mcclFanoutPool(), 2, [&](size_t k) {
-    return k == 0 ? mcclM2MRecv(comm_->prev, rp, rbytes)
-                  : mcclM2MSend(comm_->next, sp, sbytes);
+    return k == 0 ? mcclM2MRecv(rPrev_, rp, rbytes)
+                  : mcclM2MSend(rNext_, sp, sbytes);
   });
 }
 
-mcclResult Primitives::sendNext(const void* p, size_t bytes) { return mcclM2MSend(comm_->next, p, bytes); }
-mcclResult Primitives::recvPrev(void* p, size_t bytes)       { return mcclM2MRecv(comm_->prev, p, bytes); }
+mcclResult Primitives::sendNext(const void* p, size_t bytes) { return mcclM2MSend(rNext_, p, bytes); }
+mcclResult Primitives::recvPrev(void* p, size_t bytes)       { return mcclM2MRecv(rPrev_, p, bytes); }
 
 }
