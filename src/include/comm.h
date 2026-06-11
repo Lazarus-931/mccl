@@ -11,6 +11,7 @@
 #include "../definitions.h"
 #include "../graph/topo.h"
 #include "graph.h"
+#include "param.h"
 
 namespace mccl {
 
@@ -44,6 +45,8 @@ struct mcclComm {
   mcclChannel    chan;
   mcclM2M*       next   = nullptr;
   mcclM2M*       prev   = nullptr;
+  mcclM2M*       nextB  = nullptr;  // reverse-ring sockets (counter-rotating legs), disjoint from next/prev
+  mcclM2M*       prevB  = nullptr;  // so the two legs never share one; null when dual rings are off or n < 3
   mcclM2M*       parent = nullptr;
   std::vector<int>      childRanks;
   std::vector<mcclM2M*> childConns;
@@ -64,6 +67,9 @@ struct mcclComm {
 
 mcclResult mcclCommReserveStaging(mcclComm* comm, size_t bytes, void** out);
 mcclResult mcclCommReserveScratch(mcclComm* comm, size_t bytes, void** out);
+
+MCCL_PARAM(DualRings);         // 1 = counter-rotating ring legs. Must match across ranks (it changes connect).
+MCCL_PARAM(DualRingMinBytes);  // below this run one leg: splitting tiny buffers only doubles per-step latency
 
 struct mcclUniqueId {
   char internal[128];
