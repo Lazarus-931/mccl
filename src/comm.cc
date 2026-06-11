@@ -168,10 +168,7 @@ mcclResult mcclCommInitRankConfig(mcclComm** out, int nRanks, mcclUniqueId commI
       comm->childConns.clear();
       for (int d : ch.tree.down) comm->childConns.push_back(comm->peerConns.at(d));
     }
-    // Second-direction connections (peerConnsB): the reverse ring leg and tree B each get their own sockets
-    // so concurrent legs never share one. The barrier guarantees every rank finished the first batch's setup
-    // before anyone dials the second, so the listener can't misroute a B socket into the first accept loop.
-    // n == 2 needs no reverse leg: the single forward leg already drives that one link in both directions.
+
     const bool wantRingB = useRing && nRanks >= 3 && mcclParamDualRings() != 0 &&
                            ch.ring.next >= 0 && ch.ring.prev >= 0;
     const bool wantTreeB = useTree && ch.dtree;
