@@ -106,7 +106,6 @@ inline mcclResult ringAllReduce(mcclComm* comm, const void* sendbuff, void* recv
     void* stg = nullptr;
     if (mcclCommReserveStaging(comm, (maxA + maxB) * esz, &stg) != mcclSuccess) return mcclSystemError;
     mcclResult rB = mcclSuccess;
-    // Reverse leg: downstream is the forward ring's prev rank, reached over the B sockets.
     std::thread t([&]() {
       rB = ringAllReduceLeg(comm, static_cast<char*>(recvbuff) + hA * esz, hB, dt, ringOp, -1,
                             comm->nextB, comm->prevB, static_cast<char*>(stg) + maxA * esz, maxB * esz);
