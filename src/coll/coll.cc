@@ -1,5 +1,7 @@
 #include "../include/coll.h"
 
+#include <cstring>
+
 #include "../include/comm.h"
 #include "../include/graph.h"
 #include "../include/param.h"
@@ -80,6 +82,22 @@ mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size
   if (count == 0) return mcclSuccess;
   const bool ring = preferFlatTree(comm) ? false : mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
   return mcclSetLastError(mcclLaunch(comm, [=]() { return reduceImpl(comm, sendbuff, recvbuff, count, dt, op, root, ring); }));
+}
+
+mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt) {
+  if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
+  if (count == 0) return mcclSuccess;
+  const size_t stride = count * mcclDataSize(dt);
+  const size_t self   = static_cast<size_t>(comm->rank) * stride;
+  std::memcpy(static_cast<char*>(recvbuff) + self, static_cast<const char*>(sendbuff) + self, stride);
+
+  mcclGroupStart();
+  for (int p = 0; p < comm->nRanks; ++p) {
+    if (p == comm->rank) continue;
+    mcclSend(comm, static_cast<const char*>(sendbuff) + static_cast<size_t>(p) * stride, count, dt, p);
+    mcclRecv(comm, static_cast<char*>(recvbuff) + static_cast<size_t>(p) * stride, count, dt, p);
+  }
+  return mcclSetLastError(mcclGroupEnd());
 }
 
 }
@@ -171,6 +189,24 @@ int main() {
     } else {
       std::printf("[reduce] rank %d/%d participated rc=%d\n", rank, nn, static_cast<int>(rc));
     }
+    mcclPageFree(sb);
+    mcclPageFree(rb);
+  } else if (std::strcmp(opn, "alltoall") == 0) {
+    void* sb = nullptr;
+    void* rb = nullptr;
+    mcclPageAlloc(count * static_cast<size_t>(nn) * sizeof(float), &sb);
+    mcclPageAlloc(count * static_cast<size_t>(nn) * sizeof(float), &rb);
+    // Chunk bound for peer p carries this rank's id, tagged with p, so each side can verify provenance.
+    float* s = static_cast<float*>(sb);
+    for (int p = 0; p < nn; ++p) for (size_t j = 0; j < count; ++j) s[static_cast<size_t>(p) * count + j] = static_cast<float>(rank * nn + p);
+    const mcclResult rc = mcclAllToAll(comm, sb, rb, count, mcclFloat32);
+    float* rr = static_cast<float*>(rb);
+    ok = (rc == mcclSuccess);
+    // recv slot b holds the chunk rank b sent to us: value == b*nn + rank.
+    for (int b = 0; b < nn && ok; ++b)
+      for (size_t j = 0; j < count && ok; ++j)
+        if (rr[static_cast<size_t>(b) * count + j] != static_cast<float>(b * nn + rank)) ok = false;
+    std::printf("[alltoall] rank %d/%d count=%zu slots=%d %s\n", rank, nn, count, nn, ok ? "OK" : "BAD");
     mcclPageFree(sb);
     mcclPageFree(rb);
   } else {

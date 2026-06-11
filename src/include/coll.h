@@ -15,8 +15,10 @@ mcclResult mcclReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuf
 mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, int root);
 mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, mcclRedOp op, int root);
 
-// Point-to-point to an arbitrary peer. Wrap in mcclGroupStart/End to run a batch (all-to-all, scatter/gather,
-// bidirectional exchange) concurrently and deadlock-free; ungrouped, each call is one blocking transfer.
+
+mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt);
+
+
 mcclResult mcclSend(mcclComm* comm, const void* sendbuff, size_t count, mcclDataType dt, int peer);
 mcclResult mcclRecv(mcclComm* comm, void* recvbuff, size_t count, mcclDataType dt, int peer);
 
