@@ -84,18 +84,13 @@ mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size
   return mcclSetLastError(mcclLaunch(comm, [=]() { return reduceImpl(comm, sendbuff, recvbuff, count, dt, op, root, ring); }));
 }
 
-// No ring/tree choice and no GPU reduction: AllToAll is an inherently direct N-by-N exchange, so it rides the
-// grouped Send/Recv batch (runBatch in p2p.cc) — already deadlock-free (lower dials, higher accepts) and
-// concurrent (send and recv to the same peer overlap). The chunk bound for this rank is a local UMA copy,
-// because the grouped path rejects peer == rank.
 mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt) {
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
   const size_t stride = count * mcclDataSize(dt);
   const size_t self   = static_cast<size_t>(comm->rank) * stride;
   std::memcpy(static_cast<char*>(recvbuff) + self, static_cast<const char*>(sendbuff) + self, stride);
-  // Peers 0..nRanks-1 (minus self) are all valid by construction, so no Send/Recv validation can fail and
-  // leave the group open; only the transport in GroupEnd can error, which it reports through its result.
+
   mcclGroupStart();
   for (int p = 0; p < comm->nRanks; ++p) {
     if (p == comm->rank) continue;
