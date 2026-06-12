@@ -2,6 +2,7 @@
 
 #include "../socket.h"
 #include "../bootstrap.h"
+#include "../include/param.h"
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -10,12 +11,16 @@
 #include <sys/socket.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <map>
 #include <thread>
+#include <vector>
 
 namespace mccl {
+
+DEFINE_MCCL_PARAM(ProbeBurstKB, "PROBE_BURST_KB", 8192);
 
 mcclResult mcclDiscoverInterfaces(mcclIfSet* out) {
   if (out == nullptr) return mcclInvalidArgument;
@@ -94,46 +99,77 @@ mcclResult mcclProbeLiveness(std::vector<mcclEdge>& edges, int rank, int nRanks,
     if (needServer) return mcclSystemError;
     lst = -1;
   }
+  const size_t burst = static_cast<size_t>(mcclParamProbeBurstKB()) << 10;
   std::atomic<bool> stop{false};
   std::thread server;
   if (lst >= 0) server = std::thread([&]() {
+    std::vector<char> drain(1 << 20);
     while (!stop.load()) {
       int fd = -1;
       if (mcclSocketAccept(lst, 200, &fd) != mcclSuccess) continue;
       int peer = -1;
-      if (mcclSocketRecv(fd, &peer, sizeof(peer)) == mcclSuccess) mcclSocketSend(fd, &rank, sizeof(rank));
+      if (mcclSocketRecv(fd, &peer, sizeof(peer)) == mcclSuccess && mcclSocketSend(fd, &rank, sizeof(rank)) == mcclSuccess) {
+        uint32_t nb = 0;
+        if (mcclSocketRecv(fd, &nb, sizeof(nb)) == mcclSuccess && nb <= (1u << 30)) {
+          size_t left = nb;
+          bool ok = true;
+          while (left > 0 && ok) {
+            const size_t chunk = left < drain.size() ? left : drain.size();
+            ok = mcclSocketRecv(fd, drain.data(), chunk) == mcclSuccess;
+            left -= chunk;
+          }
+          char ack = 1;
+          if (ok) mcclSocketSend(fd, &ack, sizeof(ack));
+        }
+      }
       mcclSocketClose(fd);
     }
   });
 
-  std::vector<uint8_t> vote(static_cast<size_t>(nE), 0);  // per edge: 1 = live, 2 = dead
+  std::vector<float> vote(static_cast<size_t>(nE), 0.0f);
+  std::vector<char> payload(burst > 0 ? burst : 1, 0);
   for (int i = 0; i < nE; ++i) {
     if (edges[i].a != rank) continue;  // only the lower-rank endpoint probes each edge
     char ip[16];
     mcclIpStr(edges[i].ipB, ip);
     int fd = -1;
-    bool live = false;
+    float v = -1.0f;
     if (mcclSocketConnect(ip, probePort, 1500, 2, &fd) == mcclSuccess) {
       int peer = -1;
       if (mcclSocketSend(fd, &rank, sizeof(rank)) == mcclSuccess &&
-          mcclSocketRecv(fd, &peer, sizeof(peer)) == mcclSuccess && peer == edges[i].b)
-        live = true;  // reached the expected peer (not ourselves via a same-IP bridge, nor a stranger)
+          mcclSocketRecv(fd, &peer, sizeof(peer)) == mcclSuccess && peer == edges[i].b) {
+        const uint32_t nb = static_cast<uint32_t>(burst);
+        const auto t0 = std::chrono::steady_clock::now();
+        char ack = 0;
+        if (mcclSocketSend(fd, &nb, sizeof(nb)) == mcclSuccess &&
+            (nb == 0 || (mcclSocketSend(fd, payload.data(), nb) == mcclSuccess &&
+                         mcclSocketRecv(fd, &ack, sizeof(ack)) == mcclSuccess))) {
+          if (nb == 0) v = 1e6f;
+          else {
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            v = s > 0.0 ? static_cast<float>(static_cast<double>(nb) / s / 1e9) : 1e6f;
+          }
+        }
+      }
       mcclSocketClose(fd);
     }
-    vote[static_cast<size_t>(i)] = live ? 1 : 2;
+    vote[static_cast<size_t>(i)] = v;
   }
 
   // Serve until the vote all-gather completes — it only returns once EVERY rank has finished probing, so no
   // fixed grace window can cut off a slow prober (a rank with several dead edges probes for many seconds,
   // and a 500ms window falsely marked its live edges dead).
-  std::vector<uint8_t> all(static_cast<size_t>(nRanks) * static_cast<size_t>(nE), 0);
-  const mcclResult arc = mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, vote.data(), all.data(), static_cast<size_t>(nE));
+  std::vector<float> all(static_cast<size_t>(nRanks) * static_cast<size_t>(nE), 0.0f);
+  const mcclResult arc = mcclBootstrapAllGather(rootIp, rootPort, rank, nRanks, vote.data(), all.data(), static_cast<size_t>(nE) * sizeof(float));
   stop.store(true);
   if (server.joinable()) server.join();
   mcclSocketClose(lst);
   if (arc != mcclSuccess) return arc;
-  for (int i = 0; i < nE; ++i)
-    edges[static_cast<size_t>(i)].live = (all[static_cast<size_t>(edges[i].a) * static_cast<size_t>(nE) + i] == 1);
+  for (int i = 0; i < nE; ++i) {
+    const float v = all[static_cast<size_t>(edges[i].a) * static_cast<size_t>(nE) + static_cast<size_t>(i)];
+    edges[static_cast<size_t>(i)].live = v > 0.0f;
+    edges[static_cast<size_t>(i)].gbps = (v > 0.0f && v < 1e5f) ? v : 0.0f;
+  }
   return mcclSuccess;
 }
 

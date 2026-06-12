@@ -1,5 +1,7 @@
 #include "pool.h"
 
+#include <pthread/qos.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -28,6 +30,7 @@ class ThreadPool {
 
  private:
   void loop() {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;) {
       std::function<void()> task;
       {

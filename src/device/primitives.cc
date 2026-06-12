@@ -9,8 +9,9 @@
 
 namespace mccl {
 
-DEFINE_MCCL_PARAM(MetalMinBytes, "METAL_MIN_BYTES", int64_t{1} << 62);
+DEFINE_MCCL_PARAM(MetalMinBytes, "METAL_MIN_BYTES", int64_t{1} << 28);
 DEFINE_MCCL_PARAM(PipelineChunks, "PIPELINE_CHUNKS", 4);
+DEFINE_MCCL_PARAM(HubFoldChunkBytes, "HUB_FOLD_CHUNK_BYTES", 4 << 20);
 
 Primitives::Primitives(mcclComm* comm, void* buf, mcclDataType dt, mcclRedOp op, size_t maxChunkBytes)
     : buf_(static_cast<char*>(buf)),

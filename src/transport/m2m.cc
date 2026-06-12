@@ -81,7 +81,7 @@ namespace {
 DEFINE_MCCL_PARAM(ConnectTimeoutMs, "CONNECT_TIMEOUT_MS", 5000);
 DEFINE_MCCL_PARAM(AcceptTimeoutMs,  "ACCEPT_TIMEOUT_MS",  30000);
 DEFINE_MCCL_PARAM(KeepAliveIdleSec, "KEEPALIVE_IDLE_SEC", 10);
-DEFINE_MCCL_PARAM(NSocks,           "NSOCKS",             4);          // sockets per connection (measured best on TB; >=12 stalls connection setup)
+DEFINE_MCCL_PARAM(NSocks,           "NSOCKS",             2);
 DEFINE_MCCL_PARAM(StripeMinBytes,   "STRIPE_MIN_BYTES",   1 << 18);    // below this, one socket: striping's thread-spawn costs more than it saves
 
 constexpr int kConnectRetries = 50;
@@ -284,11 +284,20 @@ mcclResult mcclM2MClose(mcclM2M* c) {
   return mcclSuccess;
 }
 
+int mcclM2MFds(mcclM2M* c, int* fds, int cap) {
+  if (c == nullptr || fds == nullptr || c->res.type != M2M_TYPE_TCP || c->res.tcp.fds == nullptr) return 0;
+  const int n = c->res.tcp.nSocks < cap ? c->res.tcp.nSocks : cap;
+  for (int i = 0; i < n; ++i) fds[i] = c->res.tcp.fds[i];
+  return n;
+}
+
 struct mcclM2MListener {
   int lst;
   int nSocks;
   std::map<uint32_t, std::vector<int>> partial;  // connId -> shards seen so far; lets one accept call complete one peer while others' sockets wait
 };
+
+int mcclM2MListenerFd(mcclM2MListener* l) { return l != nullptr ? l->lst : -1; }
 
 mcclResult mcclM2MListenStart(uint16_t port, mcclM2MListener** out, uint16_t* boundPort) {
   if (out == nullptr) return mcclInvalidArgument;

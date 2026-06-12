@@ -12,6 +12,7 @@ struct mcclComm;
 struct mcclM2M;
 
 MCCL_PARAM(PipelineChunks);
+MCCL_PARAM(HubFoldChunkBytes);
 
 class Primitives {
  public:

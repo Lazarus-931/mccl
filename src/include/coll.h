@@ -22,4 +22,6 @@ mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, si
 mcclResult mcclSend(mcclComm* comm, const void* sendbuff, size_t count, mcclDataType dt, int peer);
 mcclResult mcclRecv(mcclComm* comm, void* recvbuff, size_t count, mcclDataType dt, int peer);
 
+mcclResult mcclRecvAny(mcclComm* comm, void* recvbuff, size_t count, mcclDataType dt, int* srcRank);
+
 }

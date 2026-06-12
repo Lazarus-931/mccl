@@ -14,7 +14,7 @@
 namespace mccl {
 
 namespace {
-DEFINE_MCCL_PARAM(DirectMaxBytes, "DIRECT_MAX_BYTES", 64 << 10);
+DEFINE_MCCL_PARAM(DirectMaxBytes, "DIRECT_MAX_BYTES", 2 << 20);
 DEFINE_MCCL_PARAM(DirectMaxRanks, "DIRECT_MAX_RANKS", 8);
 
 bool useDirect(const mcclComm* comm, size_t bytes) {
@@ -25,9 +25,6 @@ bool useDirect(const mcclComm* comm, size_t bytes) {
   return true;
 }
 
-bool preferFlatTree(const mcclComm* comm) {
-  return comm->chan.flatTree && comm->enabled[MCCL_ALGO_TREE] != 0;
-}
 }
 
 // Validation lives HERE, before mcclLaunch: on a non-blocking comm the lambda runs on the worker, which
@@ -48,6 +45,8 @@ mcclResult mcclAllReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, s
 mcclResult mcclAllGather(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount, mcclDataType dt) {
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (sendcount == 0) return mcclSuccess;
+  if (useDirect(comm, static_cast<size_t>(comm->nRanks) * sendcount * mcclDataSize(dt)))
+    return mcclSetLastError(mcclLaunch(comm, [=]() { return directAllGather(comm, sendbuff, recvbuff, sendcount, dt); }));
   const int algo = mcclPickAlgo(comm, sendcount * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringAllGather(comm, sendbuff, recvbuff, sendcount, dt)
@@ -58,6 +57,8 @@ mcclResult mcclAllGather(mcclComm* comm, const void* sendbuff, void* recvbuff, s
 mcclResult mcclReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (recvcount == 0) return mcclSuccess;
+  if (useDirect(comm, static_cast<size_t>(comm->nRanks) * recvcount * mcclDataSize(dt)))
+    return mcclSetLastError(mcclLaunch(comm, [=]() { return directReduceScatter(comm, sendbuff, recvbuff, recvcount, dt, op); }));
   const int algo = mcclPickAlgo(comm, recvcount * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringReduceScatter(comm, sendbuff, recvbuff, recvcount, dt, op)
@@ -69,7 +70,7 @@ mcclResult mcclBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, s
   if (comm == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (root < 0 || root >= comm->nRanks || (comm->rank == root && sendbuff == nullptr)) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
-  const int algo = preferFlatTree(comm) ? MCCL_ALGO_TREE : mcclPickAlgo(comm, count * mcclDataSize(dt));
+  const int algo = mcclPickAlgo(comm, count * mcclDataSize(dt));
   return mcclSetLastError(mcclLaunch(comm, [=]() {
     return algo == MCCL_ALGO_RING ? ringBroadcast(comm, sendbuff, recvbuff, count, dt, root)
                                   : treeBroadcast(comm, sendbuff, recvbuff, count, dt, root);
@@ -80,7 +81,9 @@ mcclResult mcclReduce(mcclComm* comm, const void* sendbuff, void* recvbuff, size
   if (comm == nullptr || sendbuff == nullptr || root < 0 || root >= comm->nRanks || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (comm->rank == root && recvbuff == nullptr) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
-  const bool ring = preferFlatTree(comm) ? false : mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
+  if (useDirect(comm, count * mcclDataSize(dt)))
+    return mcclSetLastError(mcclLaunch(comm, [=]() { return directReduce(comm, sendbuff, recvbuff, count, dt, op, root); }));
+  const bool ring = mcclPickAlgo(comm, count * mcclDataSize(dt)) == MCCL_ALGO_RING;
   return mcclSetLastError(mcclLaunch(comm, [=]() { return reduceImpl(comm, sendbuff, recvbuff, count, dt, op, root, ring); }));
 }
 
@@ -88,12 +91,14 @@ mcclResult mcclAllToAll(mcclComm* comm, const void* sendbuff, void* recvbuff, si
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr || mcclDataSize(dt) == 0) return mcclSetLastError(mcclInvalidArgument);
   if (count == 0) return mcclSuccess;
   const size_t stride = count * mcclDataSize(dt);
-  const size_t self   = static_cast<size_t>(comm->rank) * stride;
+  const int n = comm->nRanks, r = comm->rank;
+  const size_t self = static_cast<size_t>(r) * stride;
   std::memcpy(static_cast<char*>(recvbuff) + self, static_cast<const char*>(sendbuff) + self, stride);
+  if (n == 1) return mcclSuccess;
 
   mcclGroupStart();
-  for (int p = 0; p < comm->nRanks; ++p) {
-    if (p == comm->rank) continue;
+  for (int p = 0; p < n; ++p) {
+    if (p == r) continue;
     mcclSend(comm, static_cast<const char*>(sendbuff) + static_cast<size_t>(p) * stride, count, dt, p);
     mcclRecv(comm, static_cast<char*>(recvbuff) + static_cast<size_t>(p) * stride, count, dt, p);
   }

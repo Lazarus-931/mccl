@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <thread>
 
 #include "all_reduce.h"
 #include "fanout.h"
@@ -12,22 +13,59 @@
 
 namespace mccl {
 
-// Ring broadcast: a chain root -> root+1 -> ... -> root-1; each rank receives, then forwards unless next is the root.
+inline mcclResult ringBroadcastLeg(mcclComm* comm, char* base, size_t count, size_t esz, int root,
+                                   mcclDataType dt, int dir, mcclM2M* prev, mcclM2M* next) {
+  const int n = comm->nRanks, r = comm->rank;
+  Primitives prims(comm, base, dt, mcclSum, 0);
+  if (!prims.ok()) return mcclSystemError;
+  prims.bindRing(prev, next, nullptr, 0);
+  int K = static_cast<int>(mcclParamPipelineChunks());
+  if (K < 1) K = 1;
+  if (n <= 2 || count * esz < (1u << 20) || static_cast<size_t>(K) > count) K = 1;
+  auto off = [&](int i) { return chunkOffElems(count, K, i) * esz; };
+  auto len = [&](int i) { return (chunkOffElems(count, K, i + 1) - chunkOffElems(count, K, i)) * esz; };
+
+  if (r == root) {
+    for (int i = 0; i < K; ++i) MCCLCHECK(prims.sendNext(base + off(i), len(i)));
+    return mcclSuccess;
+  }
+  const bool forward = (r + dir + 2 * n) % n != root;
+  if (!forward) {
+    for (int i = 0; i < K; ++i) MCCLCHECK(prims.recvPrev(base + off(i), len(i)));
+    return mcclSuccess;
+  }
+  MCCLCHECK(prims.recvPrev(base + off(0), len(0)));
+  for (int i = 0; i + 1 < K; ++i)
+    MCCLCHECK(prims.sendRecv(base + off(i), len(i), base + off(i + 1), len(i + 1)));
+  return prims.sendNext(base + off(K - 1), len(K - 1));
+}
+
 inline mcclResult ringBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, int root) {
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || count == 0 || root < 0 || root >= comm->nRanks) return mcclInvalidArgument;
   const int n = comm->nRanks, r = comm->rank;
   const size_t bytes = count * esz;
 
-  Primitives prims(comm, recvbuff, dt, mcclSum, 0);
   if (r == root) {
     if (sendbuff == nullptr) return mcclInvalidArgument;
     if (recvbuff != sendbuff) std::memcpy(recvbuff, sendbuff, bytes);
-    return n > 1 ? prims.sendNext(recvbuff, bytes) : mcclSuccess;
+    if (n == 1) return mcclSuccess;
   }
-  MCCLCHECK(prims.recvPrev(recvbuff, bytes));
-  if ((r + 1) % n != root) return prims.sendNext(recvbuff, bytes);
-  return mcclSuccess;
+  char* rb = static_cast<char*>(recvbuff);
+
+  const bool dual = comm->nextB != nullptr && comm->prevB != nullptr && n >= 3 && count >= 2 &&
+                    bytes >= 2 * static_cast<size_t>(mcclParamDualRingMinBytes());
+  if (dual) {
+    const size_t hA = count / 2, hB = count - hA;
+    mcclResult rB = mcclSuccess;
+    std::thread t([&]() {
+      rB = ringBroadcastLeg(comm, rb + hA * esz, hB, esz, root, dt, -1, comm->nextB, comm->prevB);
+    });
+    const mcclResult rA = ringBroadcastLeg(comm, rb, hA, esz, root, dt, +1, comm->prev, comm->next);
+    t.join();
+    return rA != mcclSuccess ? rA : rB;
+  }
+  return ringBroadcastLeg(comm, rb, count, esz, root, dt, +1, comm->prev, comm->next);
 }
 
 inline mcclResult treeBroadcast(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t count, mcclDataType dt, int root) {

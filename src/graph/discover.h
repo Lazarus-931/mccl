@@ -24,6 +24,7 @@ struct mcclEdge {
   uint32_t net = 0, mask = 0;
   uint32_t ipA = 0, ipB = 0;
   bool     live = false;
+  float    gbps = 0.0f;
 };
 
 mcclResult mcclDiscoverInterfaces(mcclIfSet* out);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 #include "all_reduce.h"
 #include "fanout.h"
@@ -15,30 +16,90 @@
 
 namespace mccl {
 
-inline mcclResult ringReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
+inline mcclResult directReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
   const size_t esz = mcclDataSize(dt);
   if (esz == 0 || recvcount == 0) return mcclInvalidArgument;
   const int n = comm->nRanks, r = comm->rank;
+  const mcclRedOp wireOp = (op == mcclAvg) ? mcclSum : op;
+  const size_t blk = recvcount * esz;
+  const char* sb = static_cast<const char*>(sendbuff);
+  if (n == 1) { std::memcpy(recvbuff, sendbuff, blk); return mcclSuccess; }
+
+  std::set<int> peers;
+  for (int p = 0; p < n; ++p) if (p != r) peers.insert(p);
+  MCCLCHECK(mcclEnsurePeerConns(comm, peers));
+  void* stg = nullptr;
+  MCCLCHECK(mcclCommReserveStaging(comm, blk * static_cast<size_t>(n), &stg));
+  char* stgB = static_cast<char*>(stg);
+  std::vector<int> ps(peers.begin(), peers.end());
+  MCCLCHECK(mcclParallel(mcclFanoutPool(), 2 * ps.size(), [&](size_t k) -> mcclResult {
+    const auto it = comm->peerConns.find(ps[k / 2]);
+    if (it == comm->peerConns.end() || it->second == nullptr) return mcclInternalError;
+    return (k & 1) ? mcclM2MSend(it->second, sb + static_cast<size_t>(ps[k / 2]) * blk, blk)
+                   : mcclM2MRecv(it->second, stgB + static_cast<size_t>(ps[k / 2]) * blk, blk);
+  }));
+  std::memcpy(stgB + static_cast<size_t>(r) * blk, sb + static_cast<size_t>(r) * blk, blk);
+  std::memcpy(recvbuff, stgB, blk);
+  MCCLCHECK(reduceMulti(recvbuff, stgB + blk, recvcount, static_cast<size_t>(n - 1), recvcount, dt, wireOp, false));
+  return op == mcclAvg ? scaleBuf(recvbuff, recvcount, dt, 1.0 / n) : mcclSuccess;
+}
+
+inline mcclResult ringReduceScatterLeg(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
+                                       size_t legOff, size_t legCnt, mcclDataType dt, mcclRedOp op,
+                                       int dir, mcclM2M* prev, mcclM2M* next, char* scratch) {
+  const int n = comm->nRanks, r = comm->rank;
+  const size_t esz = mcclDataSize(dt);
+  const size_t blk = recvcount * esz;
+  const size_t legBytes = legCnt * esz;
+  char* recvS   = scratch;
+  char* fold[2] = {scratch + legBytes, scratch + 2 * legBytes};
+  const char* sb = static_cast<const char*>(sendbuff) + legOff * esz;
+  char* out = static_cast<char*>(recvbuff) + legOff * esz;
+
+  Primitives prims(comm, recvbuff, dt, op, 0);
+  if (!prims.ok()) return mcclSystemError;
+  prims.bindRing(prev, next, nullptr, 0);
+  auto wrap = [n](int x) { return ((x % n) + n) % n; };
+  mcclResult rc = mcclSuccess;
+  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
+    const int sIdx = wrap(r - dir * (i + 1));
+    const int dIdx = wrap(r - dir * (i + 2));
+    const void* sp = (i == 0) ? sb + static_cast<size_t>(sIdx) * blk : fold[(i - 1) & 1];
+    rc = prims.sendRecv(sp, legBytes, recvS, legBytes);
+    if (rc != mcclSuccess) break;
+    void* dst = (i == n - 2) ? static_cast<void*>(out) : static_cast<void*>(fold[i & 1]);
+    rc = reduceOut(dst, sb + static_cast<size_t>(dIdx) * blk, recvS, legCnt, dt, op);
+  }
+  return rc;
+}
+
+inline mcclResult ringReduceScatter(mcclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount, mcclDataType dt, mcclRedOp op) {
+  const size_t esz = mcclDataSize(dt);
+  if (esz == 0 || recvcount == 0) return mcclInvalidArgument;
+  const int n = comm->nRanks;
   const mcclRedOp ringOp = (op == mcclAvg) ? mcclSum : op;
   const size_t blk = recvcount * esz;
   if (n == 1) { std::memcpy(recvbuff, sendbuff, blk); return mcclSuccess; }
 
   void* scratch = nullptr;
   MCCLCHECK(mcclCommReserveScratch(comm, blk * 3, &scratch));
-  char* recvS   = static_cast<char*>(scratch);
-  char* fold[2] = {recvS + blk, recvS + 2 * blk};
-  const char* sb = static_cast<const char*>(sendbuff);
 
-  Primitives prims(comm, recvbuff, dt, ringOp, 0);
-  mcclResult rc = mcclSuccess;
-  for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
-    const int sIdx = (r - i - 1 + 2 * n) % n;
-    const int dIdx = (r - i - 2 + 2 * n) % n;
-    const void* sp = (i == 0) ? sb + static_cast<size_t>(sIdx) * blk : fold[(i - 1) & 1];
-    rc = prims.sendRecv(sp, blk, recvS, blk);
-    if (rc != mcclSuccess) break;
-    void* dst = (i == n - 2) ? recvbuff : static_cast<void*>(fold[i & 1]);
-    rc = reduceOut(dst, sb + static_cast<size_t>(dIdx) * blk, recvS, recvcount, dt, ringOp);
+  const bool dual = comm->nextB != nullptr && comm->prevB != nullptr && n >= 3 && recvcount >= 2 &&
+                    blk * static_cast<size_t>(n) >= 4 * static_cast<size_t>(mcclParamDualRingMinBytes());
+  mcclResult rc;
+  if (dual) {
+    const size_t hA = recvcount / 2, hB = recvcount - hA;
+    char* sA = static_cast<char*>(scratch);
+    char* sB = sA + 3 * hA * esz;
+    mcclResult rB = mcclSuccess;
+    std::thread t([&]() {
+      rB = ringReduceScatterLeg(comm, sendbuff, recvbuff, recvcount, hA, hB, dt, ringOp, -1, comm->nextB, comm->prevB, sB);
+    });
+    const mcclResult rA = ringReduceScatterLeg(comm, sendbuff, recvbuff, recvcount, 0, hA, dt, ringOp, +1, comm->prev, comm->next, sA);
+    t.join();
+    rc = rA != mcclSuccess ? rA : rB;
+  } else {
+    rc = ringReduceScatterLeg(comm, sendbuff, recvbuff, recvcount, 0, recvcount, dt, ringOp, +1, comm->prev, comm->next, static_cast<char*>(scratch));
   }
   if (rc == mcclSuccess && op == mcclAvg) rc = scaleBuf(recvbuff, recvcount, dt, 1.0 / n);
   return rc;
@@ -75,37 +136,70 @@ inline mcclResult treeReduceScatter(mcclComm* comm, const void* sendbuff, void* 
     std::memcpy(recvbuff, px + myPos * blk, blk);
     if (op == mcclAvg) MCCLCHECK(scaleBuf(recvbuff, recvcount, dt, 1.0 / n));
 
-    void* pc = nullptr;
-    if (!comm->childConns.empty()) MCCLCHECK(mcclCommReserveStaging(comm, blk * static_cast<size_t>(n), &pc));
-    for (size_t k = 0; k < comm->childConns.size(); ++k) {
-      const std::vector<int> Sc = subtreeRanks(ch, comm->childRanks[k]);
-      for (size_t j = 0; j < Sc.size(); ++j) {
-        const size_t pos = static_cast<size_t>(std::lower_bound(Sx.begin(), Sx.end(), Sc[j]) - Sx.begin());
-        std::memcpy(static_cast<char*>(pc) + j * blk, px + pos * blk, blk);
-      }
-      MCCLCHECK(mcclM2MSend(comm->childConns[k], pc, Sc.size() * blk));
+    const size_t nc = comm->childConns.size();
+    std::vector<std::vector<int>> Sc(nc);
+    std::vector<size_t> off(nc, 0);
+    size_t tot = 0;
+    for (size_t k = 0; k < nc; ++k) {
+      Sc[k] = subtreeRanks(ch, comm->childRanks[k]);
+      off[k] = tot;
+      tot += Sc[k].size() * blk;
     }
-    return mcclSuccess;
+    char* pc = nullptr;
+    if (nc > 0) {
+      void* pv = nullptr;
+      MCCLCHECK(mcclCommReserveStaging(comm, tot, &pv));
+      pc = static_cast<char*>(pv);
+    }
+    for (size_t k = 0; k < nc; ++k)
+      for (size_t j = 0; j < Sc[k].size(); ++j) {
+        const size_t pos = static_cast<size_t>(std::lower_bound(Sx.begin(), Sx.end(), Sc[k][j]) - Sx.begin());
+        std::memcpy(pc + off[k] + j * blk, px + pos * blk, blk);
+      }
+    return forEachChild(nc, [&](size_t k) {
+      return mcclM2MSend(comm->childConns[k], pc + off[k], Sc[k].size() * blk);
+    });
   }
 
+  const size_t whole = recvcount * static_cast<size_t>(n);
+  const size_t total = blk * static_cast<size_t>(n);
+  const size_t chunkBytes = static_cast<size_t>(mcclParamHubFoldChunkBytes());
+  const int nch = total <= chunkBytes ? 1 : static_cast<int>((total + chunkBytes - 1) / chunkBytes);
+  auto off = [&](int i) { return chunkOffElems(whole, nch, i); };
+  auto len = [&](int i) { return chunkOffElems(whole, nch, i + 1) - chunkOffElems(whole, nch, i); };
+
   if (comm->parent != nullptr) {
-    MCCLCHECK(mcclM2MSend(comm->parent, sendbuff, blk * static_cast<size_t>(n)));
+    for (int i = 0; i < nch; ++i)
+      MCCLCHECK(mcclM2MSend(comm->parent, static_cast<const char*>(sendbuff) + off(i) * esz, len(i) * esz));
     return mcclM2MRecv(comm->parent, recvbuff, blk);
   }
 
   const size_t nc = comm->childConns.size();
+  size_t maxEl = 0;
+  for (int i = 0; i < nch; ++i) maxEl = std::max(maxEl, len(i));
   void* work = nullptr;
   void* stg  = nullptr;  // root uses no Primitives, so staging is free for the per-child gather (both arenas page-aligned for the Metal fold)
-  MCCLCHECK(mcclCommReserveScratch(comm, blk * static_cast<size_t>(n), &work));
-  MCCLCHECK(mcclCommReserveStaging(comm, blk * static_cast<size_t>(n) * nc, &stg));
-  std::memcpy(work, sendbuff, blk * static_cast<size_t>(n));
-  const bool gpu = pageAligned(work);  // Metal availability is probed lazily in reduceMulti, past the size gate
-  const size_t whole = recvcount * static_cast<size_t>(n);
+  MCCLCHECK(mcclCommReserveScratch(comm, total, &work));
+  MCCLCHECK(mcclCommReserveStaging(comm, 2 * maxEl * esz * nc, &stg));
+  std::memcpy(work, sendbuff, total);
 
-  mcclResult res = forEachChild(nc, [&](size_t k) {  // root: gather every leaf's full input (one link each), fold in one pass, scatter blocks
-    return mcclM2MRecv(comm->childConns[k], static_cast<char*>(stg) + k * blk * static_cast<size_t>(n), blk * static_cast<size_t>(n));
-  });
-  if (res == mcclSuccess) res = reduceMulti(work, stg, whole, nc, whole, dt, redOp, gpu);
+  auto recvChunk = [&](int i) {
+    char* half = static_cast<char*>(stg) + static_cast<size_t>(i & 1) * maxEl * esz * nc;
+    return forEachChild(nc, [&](size_t k) {
+      return mcclM2MRecv(comm->childConns[k], half + k * maxEl * esz, len(i) * esz);
+    });
+  };
+  mcclResult res = nc == 0 ? mcclSuccess : recvChunk(0);
+  for (int i = 0; i < nch && nc > 0 && res == mcclSuccess; ++i) {
+    mcclResult nres = mcclSuccess;
+    std::thread t;
+    if (i + 1 < nch) t = std::thread([&, i]() { nres = recvChunk(i + 1); });
+    char* dst = static_cast<char*>(work) + off(i) * esz;
+    res = reduceMulti(dst, static_cast<char*>(stg) + static_cast<size_t>(i & 1) * maxEl * esz * nc,
+                      len(i), nc, maxEl, dt, redOp, pageAligned(dst));
+    if (t.joinable()) t.join();
+    if (res == mcclSuccess) res = nres;
+  }
   if (res == mcclSuccess && op == mcclAvg) res = scaleBuf(work, whole, dt, 1.0 / n);
   if (res == mcclSuccess) std::memcpy(recvbuff, static_cast<char*>(work) + static_cast<size_t>(r) * blk, blk);
   if (res == mcclSuccess)

@@ -236,6 +236,8 @@ mcclResult mcclCommDestroy(mcclComm* comm) {
   mcclWorkerStop(comm);  // join before freeing the connections the worker uses
   for (auto& kv : comm->peerConns) if (kv.second) mcclM2MClose(kv.second);  // the two maps own everything; the channel pointers only alias
   for (auto& kv : comm->peerConnsB) if (kv.second) mcclM2MClose(kv.second);
+  for (auto& kv : comm->p2pOut) if (kv.second) mcclM2MClose(kv.second);
+  for (auto& kv : comm->p2pIn) if (kv.second) mcclM2MClose(kv.second);
   if (comm->listener) mcclM2MListenClose(comm->listener);
   if (comm->staging) mcclPageFree(comm->staging);
   if (comm->scratch) mcclPageFree(comm->scratch);
@@ -294,6 +296,8 @@ mcclResult mcclCommAbort(mcclComm* comm) {
     std::lock_guard<std::mutex> lk(comm->connMu);
     for (auto& kv : comm->peerConns)  if (kv.second) mcclM2MShutdown(kv.second);
     for (auto& kv : comm->peerConnsB) if (kv.second) mcclM2MShutdown(kv.second);
+    for (auto& kv : comm->p2pOut) if (kv.second) mcclM2MShutdown(kv.second);
+    for (auto& kv : comm->p2pIn) if (kv.second) mcclM2MShutdown(kv.second);
     if (comm->listener) mcclM2MListenShutdown(comm->listener);
   }
   mcclWorkerStop(comm);

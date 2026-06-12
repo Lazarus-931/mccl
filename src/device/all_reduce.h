@@ -60,8 +60,8 @@ inline mcclResult directAllReduce(mcclComm* comm, const void* sendbuff, void* re
 }
 
 
-inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt, mcclRedOp op,
-                                   int dir, mcclM2M* prev, mcclM2M* next, void* stg, size_t stgStride) {
+inline mcclResult ringReducePhaseLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt, mcclRedOp op,
+                                     int dir, mcclM2M* prev, mcclM2M* next, void* stg, size_t stgStride) {
   const int n = comm->nRanks, r = comm->rank;
   Primitives prims(comm, buf, dt, op, 0);
   if (!prims.ok()) return mcclSystemError;
@@ -74,11 +74,30 @@ inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mccl
     const int s = wrap(r - dir * i), d = wrap(r - dir * (i + 1));
     rc = prims.recvReduceSend(off(s), len(s), off(d), len(d));
   }
+  return rc;
+}
+
+inline mcclResult ringGatherPhaseLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt,
+                                     int dir, mcclM2M* prev, mcclM2M* next) {
+  const int n = comm->nRanks, r = comm->rank;
+  Primitives prims(comm, buf, dt, mcclSum, 0);
+  if (!prims.ok()) return mcclSystemError;
+  prims.bindRing(prev, next, nullptr, 0);
+  auto wrap = [n](int x) { return ((x % n) + n) % n; };
+  auto off = [&](int c) { return chunkOffElems(count, n, c); };
+  auto len = [&](int c) { return chunkOffElems(count, n, c + 1) - chunkOffElems(count, n, c); };
+  mcclResult rc = mcclSuccess;
   for (int i = 0; i < n - 1 && rc == mcclSuccess; ++i) {
     const int s = wrap(r - dir * (i - 1)), d = wrap(r - dir * i);
     rc = prims.recvCopySend(off(s), len(s), off(d), len(d));
   }
   return rc;
+}
+
+inline mcclResult ringAllReduceLeg(mcclComm* comm, void* buf, size_t count, mcclDataType dt, mcclRedOp op,
+                                   int dir, mcclM2M* prev, mcclM2M* next, void* stg, size_t stgStride) {
+  MCCLCHECK(ringReducePhaseLeg(comm, buf, count, dt, op, dir, prev, next, stg, stgStride));
+  return ringGatherPhaseLeg(comm, buf, count, dt, dir, prev, next);
 }
 
 

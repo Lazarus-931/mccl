@@ -54,8 +54,8 @@ mcclResult mcclTopoGetSystem(int nRanks, const mcclEdge* edges, int nEdges,
   for (int i = 0; i < nEdges; ++i) {
     const mcclEdge& e = edges[i];
     if (!e.live || e.a < 0 || e.a >= nRanks || e.b < 0 || e.b >= nRanks) continue;
-    out->nodes[static_cast<size_t>(e.a)].links.push_back(mcclTopoLink{LINK_TB, tbBw, e.b, e.ipA, e.ipB});
-    out->nodes[static_cast<size_t>(e.b)].links.push_back(mcclTopoLink{LINK_TB, tbBw, e.a, e.ipB, e.ipA});
+    out->nodes[static_cast<size_t>(e.a)].links.push_back(mcclTopoLink{LINK_TB, tbBw, e.gbps, e.b, e.ipA, e.ipB});
+    out->nodes[static_cast<size_t>(e.b)].links.push_back(mcclTopoLink{LINK_TB, tbBw, e.gbps, e.a, e.ipB, e.ipA});
   }
 
   out->lanAllToAll = (lanIp != nullptr);
@@ -107,8 +107,11 @@ int mcclTopoDegree(const mcclTopoSystem& sys, int rank) {
 bool mcclTopoDirectLink(const mcclTopoSystem& sys, int a, int b, float* bw, uint32_t* ipB) {
   const int n = static_cast<int>(sys.nodes.size());
   if (a < 0 || a >= n || b < 0 || b >= n || a == b) return false;
+  const mcclTopoLink* best = nullptr;
+  auto rate = [](const mcclTopoLink& l) { return l.measured > 0.0f ? l.measured : l.bw; };
   for (const mcclTopoLink& l : sys.nodes[static_cast<size_t>(a)].links)
-    if (l.type == LINK_TB && l.remote == b) { if (bw) *bw = l.bw; if (ipB) *ipB = l.ipRemote; return true; }
+    if (l.type == LINK_TB && l.remote == b && (best == nullptr || rate(l) > rate(*best))) best = &l;
+  if (best != nullptr) { if (bw) *bw = best->bw; if (ipB) *ipB = best->ipRemote; return true; }
   if (sys.lanAllToAll && sys.nodes[static_cast<size_t>(a)].lanIp != 0 && sys.nodes[static_cast<size_t>(b)].lanIp != 0) {
     if (bw) *bw = mcclLanBw();
     if (ipB) *ipB = sys.nodes[static_cast<size_t>(b)].lanIp;

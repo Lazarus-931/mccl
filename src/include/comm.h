@@ -63,6 +63,8 @@ struct mcclComm {
   std::mutex              connMu;              // guards map INSERTS (owner thread) vs Abort's iteration (any thread); owner-thread reads need no lock
   std::map<int, mcclM2M*> peerConns;           // owns all connections; next/prev/parent/childConns alias into it
   std::map<int, mcclM2M*> peerConnsB;          // second tree's own connections (dtree), kept separate so the trees never share a socket
+  std::map<int, mcclM2M*> p2pOut;
+  std::map<int, mcclM2M*> p2pIn;
 };
 
 mcclResult mcclCommReserveStaging(mcclComm* comm, size_t bytes, void** out);
@@ -100,14 +102,12 @@ int        mcclPickAlgo(const mcclComm* comm, size_t bytes);
 mcclResult mcclEnsurePeerConns(mcclComm* comm, const std::set<int>& peers);
 mcclResult mcclEnsurePeerConnsInto(mcclComm* comm, const std::set<int>& peers, std::map<int, mcclM2M*>& target);
 
-// A fatal (transport/system) error desynchronizes the channel and poisons the comm so no later collective
-// runs over it; a per-call usage error (bad arg) does not.
+
 inline bool mcclResultFatal(mcclResult r) {
   return r == mcclSystemError || r == mcclInternalError || r == mcclRemoteError;
 }
 
-// Run op inline (blocking, the default — zero std::function alloc on the hot path) or hand it to the worker
-// (non-blocking) so its transfer overlaps the caller's compute. Drive one comm from one thread at a time.
+
 template <typename Fn>
 inline mcclResult mcclLaunch(mcclComm* comm, Fn&& op) {
   if (comm == nullptr) return mcclInvalidArgument;
@@ -122,10 +122,10 @@ inline mcclResult mcclLaunch(mcclComm* comm, Fn&& op) {
 
 mcclResult mcclCommSplit(mcclComm* comm, int color, int key, mcclComm** newcomm, const mcclConfig* config);
 
-// Group Send/Recv: ops between Start/End on a comm run as one concurrent batch (a send + recv on a link
-// overlap). Collectives still execute eagerly — grouping only batches point-to-point.
+
 mcclResult mcclGroupStart();
 mcclResult mcclGroupEnd();
+mcclResult mcclGroupAbort();
 
 mcclResult mcclGetLastError(const mcclComm* comm);
 mcclResult mcclSetLastError(mcclResult r);

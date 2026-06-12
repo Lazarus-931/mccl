@@ -19,6 +19,7 @@ const char* mcclPathTypeStr(mcclPathType t);
 struct mcclTopoLink {
   mcclLinkType type     = LINK_LOC;
   float        bw       = 0.0f;
+  float        measured = 0.0f;
   int          remote   = -1;
   uint32_t     ipLocal  = 0;
   uint32_t     ipRemote = 0;

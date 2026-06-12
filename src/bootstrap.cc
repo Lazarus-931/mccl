@@ -1,5 +1,6 @@
 #include "bootstrap.h"
 
+#include "pool.h"
 #include "socket.h"
 #include "include/checks.h"
 
@@ -63,8 +64,9 @@ mcclResult mcclBootstrapAllGather(const char* rootIp, uint16_t rootPort, int ran
     // still open, its SYN lands in this round's backlog and is RST on close, failing the next round outright.
     mcclSocketClose(lst);
     lst = -1;
-    for (int r = 1; r < nRanks && rc == mcclSuccess; ++r)
-      rc = mcclSocketSend(conns[r], recv, total);
+    rc = mcclParallel(mcclFanoutPool(), static_cast<size_t>(nRanks - 1), [&](size_t i) {
+      return mcclSocketSend(conns[i + 1], recv, total);
+    });
   done:
     mcclSocketClose(lst);
     for (int c : conns) mcclSocketClose(c);
