@@ -47,6 +47,17 @@ $ clang++ -std=c++17 app.cc -I<prefix>/include/mccl/include \
 If `reduce.metal` is not beside the binary, point `MCCL_METAL_DIR=<prefix>/share/mccl` at the installed
 copy. Tests and benchmarks live in a separate `mccl-tests` repository.
 
+## Performance
+
+
+![3 Macs vs 1 across batch sizes](docs/perf-scaling.png)
+
+| batch | 64 MB | 256 MB | 1 GB | 4 GB | 32 GB |
+|---|---|---|---|---|---|
+| speedup vs 1 Mac | 1.0× | 1.7× | 2.1× | 2.7× | **2.9×** |
+
+
+
 ## Structure
 
 ```
